@@ -1,0 +1,109 @@
+import json
+import shlex
+
+from pydantic import BaseModel, ConfigDict
+
+from uni_agent.interaction.tool_parser import FunctionCallFormatError, XMLToolParser
+from uni_agent.tools import ToolConfig
+from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionToolCall, OpenAIFunctionToolSchema
+
+
+class ToolsManagerConfig(BaseModel):
+    """Config for the tools list."""
+
+    tools: list[ToolConfig]
+    model_config = ConfigDict(extra="ignore")
+
+
+class ToolsManager:
+    """Builds tool instances and OpenAI tool schemas from ToolsConfig."""
+
+    def __init__(self, tools_manager_config: ToolsManagerConfig):
+        self.tools_manager_config = tools_manager_config
+        self.tools = [tc.get_tool() for tc in tools_manager_config.tools]
+        self.tools_schemas = [t.get_tool_schema() for t in self.tools]
+
+    async def parse_action(
+        self,
+        model_output: str,
+    ) -> dict:
+        tool_parser = XMLToolParser()
+        tools = [OpenAIFunctionToolSchema(**schema) for schema in self.tools_schemas]
+        content, tool_calls = tool_parser.extract_tool_calls(model_output, tools)
+
+        if len(tool_calls) == 0:
+            raise FunctionCallFormatError("No function call found in the response.")
+        elif len(tool_calls) > 1:
+            raise FunctionCallFormatError(f"Number of tool calls {len(tool_calls)} exceeds max_parallel_calls 1.")
+
+        return content, tool_calls
+
+    async def parse_structured_action(
+        self,
+        content: str,
+        tool_calls_data: list[dict],
+    ) -> tuple[str, list[OpenAIFunctionToolCall]]:
+        tool_calls = []
+        valid_names = {schema["function"]["name"] for schema in self.tools_schemas}
+        for tool_call_data in tool_calls_data:
+            function_data = tool_call_data["function"]
+            function_name = function_data["name"]
+            if function_name not in valid_names:
+                raise FunctionCallFormatError(
+                    f"Invalid action: function '{function_name}' is not defined in the tools list.\n"
+                    f"Allowed functions should be one of: {sorted(valid_names)}."
+                )
+            arguments = function_data.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise FunctionCallFormatError(
+                        f"Invalid action: arguments for function '{function_name}' are not valid JSON."
+                    ) from exc
+
+            function_call = OpenAIFunctionCallSchema(name=function_name, arguments=arguments)
+            tool_calls.append(
+                OpenAIFunctionToolCall(
+                    id=tool_call_data["id"],
+                    type=tool_call_data.get("type", "function"),
+                    function=function_call,
+                )
+            )
+
+        if len(tool_calls) == 0:
+            raise FunctionCallFormatError("No function call found in the response.")
+        if len(tool_calls) > 1:
+            raise FunctionCallFormatError(f"Number of tool calls {len(tool_calls)} exceeds max_parallel_calls 1.")
+        return content, tool_calls
+
+    def get_tool_bash_command(self, tool_call: OpenAIFunctionToolCall) -> str:
+        function: OpenAIFunctionCallSchema = tool_call.function
+        func_name: str = function.name
+        func_params: dict = function.arguments
+
+        if func_name == "submit":
+            return "echo '<<<Finished>>>'"
+
+        if func_name == "execute_bash":
+            return func_params.get("command", "")
+
+        # Start building the command
+        cmd_parts = [shlex.quote(func_name)]
+
+        # If there's a 'command' parameter, put that next
+        base_command = func_params.get("command")
+        if base_command is not None:
+            cmd_parts.append(shlex.quote(base_command))
+
+        # Append all other parameters
+        for param_key, param_value in func_params.items():
+            if param_key == "command":
+                continue
+
+            # Safely quote the param_value
+            param_value_quoted = shlex.quote(str(param_value))
+            cmd_parts.append(f"--{param_key}")
+            cmd_parts.append(param_value_quoted)
+
+        return " ".join(cmd_parts)

@@ -1,0 +1,35 @@
+- name: swe_agent
+
+  _target_: uni_agent.agent_loop.AgentLoop
+
+  concurrency: 512
+  log_dir: /tmp/swebench_qwen3_coder
+  mask_abnormal_exit_traj: true
+
+  interaction:
+    action_timeout: 300
+    max_turns: 100
+
+  env:
+    deployment:
+      type: vefaas
+      command: curl -fsSL https://pjw-test-empty.tos-cn-beijing.ivolces.com/bin/tos_swe_rex.sh | bash -s -- {token}
+      timeout: 600
+      function_id: xxxxxx
+      function_route: xxxxxx
+    env_variables:
+      PIP_PROGRESS_BAR: "off"
+      PIP_CACHE_DIR: "~/.cache/pip"
+      PAGER: "cat"
+      MANPAGER: "cat"
+      LESS: "-R"
+      TQDM_DISABLE: "1"
+      GIT_PAGER: "cat"
+
+  tools:
+    - name: str_replace_editor
+    - name: execute_bash
+    - name: submit
+
+  reward:
+    eval_timeout: 600

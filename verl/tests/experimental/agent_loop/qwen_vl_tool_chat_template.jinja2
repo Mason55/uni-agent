@@ -1,0 +1,197 @@
+{% set image_count = namespace(value=0) %}
+{% set video_count = namespace(value=0) %}
+
+{% macro render_extra_keys(json_dict, handled_keys) %}
+    {%- if json_dict is mapping %}
+        {%- for json_key in json_dict if json_key not in handled_keys %}
+            {%- if json_dict[json_key] is mapping or (json_dict[json_key] is sequence and json_dict[json_key] is not string) %}
+                {{- '\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | tojson | safe) ~ '</' ~ json_key ~ '>' }}
+            {%- else %}
+                {{- '\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | string) ~ '</' ~ json_key ~ '>' }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{% endmacro %}
+
+{% macro render_message_content(message_content) %}
+    {%- if message_content is string %}
+        {{- message_content }}
+    {%- elif message_content is sequence %}
+        {%- for content in message_content %}
+            {%- if content['type'] == 'image' or 'image' in content or 'image_url' in content %}
+                {% set image_count.value = image_count.value + 1 %}
+                {%- if add_vision_id %}Picture {{ image_count.value }}: {% endif -%}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif content['type'] == 'video' or 'video' in content %}
+                {% set video_count.value = video_count.value + 1 %}
+                {%- if add_vision_id %}Video {{ video_count.value }}: {% endif -%}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif content['type'] == 'text' or 'text' in content %}
+                {{- content['text'] }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif message_content is not none %}
+        {{- message_content | string }}
+    {%- endif %}
+{% endmacro %}
+
+{% macro render_tool_call(tool_call) %}
+    {%- if tool_call.function is defined %}
+        {%- set tool_call = tool_call.function %}
+    {%- endif %}
+    {%- if tool_call.arguments is mapping %}
+        {{- '<tool_call>\n<function=' ~ tool_call.name ~ '>\n' }}
+        {%- for args_name, args_value in tool_call.arguments|items %}
+            {{- '<parameter=' ~ args_name ~ '>\n' }}
+            {%- if args_value is mapping or (args_value is sequence and args_value is not string) %}
+                {{- args_value | tojson | safe }}
+            {%- else %}
+                {{- args_value | string }}
+            {%- endif %}
+            {{- '\n</parameter>\n' }}
+        {%- endfor %}
+        {{- '</function>\n</tool_call>' }}
+    {%- else %}
+        {{- '<tool_call>\n{"name": "' ~ tool_call.name ~ '", "arguments": ' }}
+        {%- if tool_call.arguments is string %}
+            {{- tool_call.arguments }}
+        {%- else %}
+            {{- tool_call.arguments | tojson }}
+        {%- endif %}
+        {{- '}\n</tool_call>' }}
+    {%- endif %}
+{% endmacro %}
+
+{%- if messages[0]["role"] == "system" %}
+    {%- set system_message = messages[0]["content"] %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+
+{%- if not tools is defined %}
+    {%- set tools = [] %}
+{%- endif %}
+
+{{- '<|im_start|>system\n' }}
+{%- if system_message is defined %}
+    {{- render_message_content(system_message) }}
+{%- else %}
+    {{- 'You are a helpful assistant.' }}
+{%- endif %}
+{%- if tools is iterable and tools | length > 0 %}
+    {{- '\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
+    {%- for tool in tools %}
+        {%- if tool.function is defined %}
+            {%- set tool = tool.function %}
+        {%- endif %}
+        {{- '\n<function>\n<name>' ~ tool.name ~ '</name>' }}
+        {%- if tool.description is defined %}
+            {{- '\n<description>' ~ (tool.description | trim) ~ '</description>' }}
+        {%- endif %}
+        {{- '\n<parameters>' }}
+        {%- if tool.parameters is defined and tool.parameters is mapping and tool.parameters.properties is defined and tool.parameters.properties is mapping %}
+            {%- for param_name, param_fields in tool.parameters.properties|items %}
+                {{- '\n<parameter>' }}
+                {{- '\n<name>' ~ param_name ~ '</name>' }}
+                {%- if param_fields.type is defined %}
+                    {{- '\n<type>' ~ (param_fields.type | string) ~ '</type>' }}
+                {%- endif %}
+                {%- if param_fields.description is defined %}
+                    {{- '\n<description>' ~ (param_fields.description | trim) ~ '</description>' }}
+                {%- endif %}
+                {%- set handled_keys = ['name', 'type', 'description'] %}
+                {{- render_extra_keys(param_fields, handled_keys) }}
+                {{- '\n</parameter>' }}
+            {%- endfor %}
+        {%- endif %}
+        {%- set handled_keys = ['type', 'properties'] %}
+        {{- render_extra_keys(tool.parameters, handled_keys) }}
+        {{- '\n</parameters>' }}
+        {%- set handled_keys = ['type', 'name', 'description', 'parameters'] %}
+        {{- render_extra_keys(tool, handled_keys) }}
+        {{- '\n</function>' }}
+    {%- endfor %}
+    {{- '\n</tools>' }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+{%- endif %}
+{{- '<|im_end|>\n' }}
+
+{%- set ns = namespace(multi_step_tool=true, last_query_index=loop_messages|length - 1) %}
+{%- for message in loop_messages[::-1] %}
+    {%- set index = (loop_messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- if message.content is string %}
+            {%- if not (message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+                {%- set ns.multi_step_tool = false %}
+                {%- set ns.last_query_index = index %}
+            {%- endif %}
+        {%- else %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+
+{%- for message in loop_messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if message.role == "user" or message.role == "system" %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {{- render_message_content(message.content) }}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- elif '</think>' in content %}
+            {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- endif %}
+        {%- set has_text_before_tools = false %}
+        {{- '<|im_start|>assistant' }}
+        {%- if loop.index0 > ns.last_query_index and (loop.last or reasoning_content) %}
+            {{- '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>' }}
+            {%- if content %}
+                {{- '\n\n' + content.lstrip('\n') }}
+            {%- endif %}
+            {%- set has_text_before_tools = true %}
+        {%- elif content %}
+            {{- '\n' + content }}
+            {%- set has_text_before_tools = true %}
+        {%- endif %}
+        {%- if message.tool_calls is defined and message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if has_text_before_tools or not loop.first %}
+                    {{- '\n' }}
+                {%- endif %}
+                {{- render_tool_call(tool_call) }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (loop_messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- render_message_content(message.content) }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (loop_messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {{- render_message_content(message.content) }}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}

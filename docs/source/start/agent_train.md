@@ -137,10 +137,8 @@ Below is the default config used by the training scripts, with explanations for 
   env:
     deployment:
       type: vefaas
-      command: curl -fsSL https://pjw-test-empty.tos-cn-beijing.ivolces.com/bin/tos_swe_rex.sh | bash -s -- {token}
+      command: curl -fsSL https://vefaas-swe.tos-cn-beijing.ivolces.com/swe-rex/install_1.4.0.sh | bash -s -- {token}
       timeout: 600
-      function_id: s1lwmntk
-      function_route: https://sd48oga819ma6giekqtvg.apigateway-cn-beijing.volceapi.com
     env_variables:
       PIP_PROGRESS_BAR: "off"
       PIP_CACHE_DIR: "~/.cache/pip"

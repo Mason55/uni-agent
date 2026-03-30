@@ -41,7 +41,7 @@ elif impl == "vefaas":
     deployment_config = {
         "type": "vefaas",
         "image": "enterprise-public-2-cn-beijing.cr.volces.com/vefaas-public/python:3.12",
-        "command": "curl -fsSL https://pjw-test-empty.tos-cn-beijing.ivolces.com/bin/tos_swe_rex.sh | bash -s -- {token}",
+        "command": "curl -fsSL https://vefaas-swe.tos-cn-beijing.ivolces.com/swe-rex/install_1.4.0.sh | bash -s -- {token}",
         "timeout": 300.0,
         "startup_timeout": 180.0,
         "function_id": os.getenv("VEFAAS_FUNCTION_ID"),

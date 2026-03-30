@@ -122,7 +122,7 @@ Below is an annotated version. Each comment explains the corresponding key and t
     deployment:
       # Deployment backend configuration. image is set at runtime from tools_kwargs.
       type: vefaas
-      command: curl -fsSL https://pjw-test-empty.tos-cn-beijing.ivolces.com/bin/tos_swe_rex.sh | bash -s -- {token}
+      command: curl -fsSL https://vefaas-swe.tos-cn-beijing.ivolces.com/swe-rex/install_1.4.0.sh | bash -s -- {token}
       timeout: 600        # Runtime operation timeout (seconds).
       function_id: xxxxxx
       function_route: xxxxxx

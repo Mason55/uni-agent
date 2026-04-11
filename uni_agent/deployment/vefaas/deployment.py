@@ -310,7 +310,7 @@ def create_sandbox(
             volcenginesdkvefaas.CreateSandboxRequest(
                 function_id=function_id,
                 instance_image_info=instance_image_info,
-                timeout=1200,  # 20h
+                timeout=120,  # 2 hours
             )
         )
         end_time = time.time()

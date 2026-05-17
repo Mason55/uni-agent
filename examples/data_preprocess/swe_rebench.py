@@ -124,7 +124,14 @@ def build_swe_rebench():
         }
         instance_id = metadata["instance_id"]
         image_name = get_image_name(dataset_id, instance_id)
-        reset_script = ""
+        reset_cmds = [
+            "git tag -d $(git tag -l) || true",
+            "git reflog expire --expire=now --all || true",
+            "git gc --prune=now || true",
+            f"git checkout {metadata['base_commit']} || true",
+            "git clean -fdq || true",
+        ]
+        reset_script = " && ".join(reset_cmds)
         sample = {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},

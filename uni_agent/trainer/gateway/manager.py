@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 
 async def _await_object_ref(object_ref):
@@ -46,9 +47,9 @@ class GatewayManager:
         self.active_sessions_per_gateway[gateway_index] -= 1
         return trajectories
 
-    async def complete_session(self, session_id: str) -> None:
+    async def complete_session(self, session_id: str, reward_info: dict[str, Any] | None = None) -> None:
         gateway, _ = self._get_gateway(session_id)
-        await _await_object_ref(gateway.complete_session.remote(session_id=session_id))
+        await _await_object_ref(gateway.complete_session.remote(session_id=session_id, reward_info=reward_info))
 
     async def abort_session(self, session_id: str) -> None:
         gateway, gateway_index = self._get_gateway(session_id)

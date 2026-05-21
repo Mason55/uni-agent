@@ -81,9 +81,9 @@ class GatewayServingRuntime:
         gateway_manager = self._require_session_runtime()
         return await gateway_manager.finalize_session(session_id=session_id)
 
-    async def complete_session(self, session_id: str) -> None:
+    async def complete_session(self, session_id: str, reward_info: dict[str, Any] | None = None) -> None:
         gateway_manager = self._require_session_runtime()
-        await gateway_manager.complete_session(session_id=session_id)
+        await gateway_manager.complete_session(session_id=session_id, reward_info=reward_info)
 
     async def abort_session(self, session_id: str) -> None:
         gateway_manager = self._require_session_runtime()

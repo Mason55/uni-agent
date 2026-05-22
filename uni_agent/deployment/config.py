@@ -95,6 +95,54 @@ class ModalDeploymentConfig(BaseModel):
         return ModalDeployment.from_config(self, run_id)
 
 
+class YrDeploymentConfig(BaseModel):
+    """Configuration for YR (AKernel) remote sandbox deployment."""
+
+    image: str | None = None
+    """Docker image URL for the sandbox. Uses the default runtime image when unset."""
+    cpu: int = 2000
+    """CPU request in milli-cores."""
+    memory: int = 4096
+    """Memory request in MiB."""
+    cpu_limit: int = 0
+    """CPU cgroup limit in milli-cores. 0 means equal to cpu."""
+    mem_limit: int = 0
+    """Memory cgroup limit in MiB. 0 means equal to memory."""
+    idle_timeout: int = 600
+    """Idle timeout in seconds before auto-termination."""
+    env: dict[str, str] | None = None
+    """Environment variables injected into the sandbox."""
+    name: str | None = None
+    """Optional sandbox instance name."""
+    cwd: str | None = None
+    """Initial working directory inside the sandbox."""
+    port: int = 8000
+    """Port for swerex.server and gateway Port Forwarding (sandbox-api: port_forwardings=[port])."""
+    internal: bool = False
+    """Pass internal=True to get_port_url for in-cluster traefik access (sandbox-api Port Forwarding)."""
+    command: str | None = None
+    """Command to start swerex inside the sandbox. Supports {token} and {port} placeholders."""
+    timeout: float = 60.0
+    """Timeout for RemoteRuntime operations."""
+    startup_timeout: float = 180.0
+    """Timeout waiting for swerex server to become alive."""
+    proxy: str | None = None
+    """Proxy for RemoteRuntime HTTP requests."""
+    ssl_verify: bool = False
+    """Verify TLS when connecting to the port-forwarded https URL (self-signed clusters often need False)."""
+    sandbox_kwargs: dict[str, Any] = Field(default_factory=dict)
+    """Extra keyword arguments passed to akernel_sdk.Sandbox."""
+
+    type: Literal["yr"] = "yr"
+    """Discriminator for (de)serialization/CLI. Do not change."""
+    model_config = ConfigDict(extra="forbid")
+
+    def get_deployment(self, run_id: str):
+        from .yr.deployment import YrDeployment
+
+        return YrDeployment.from_config(self, run_id)
+
+
 class VefaasDeploymentConfig(BaseModel):
     """Configuration for VEFAAS deployment."""
 
@@ -124,6 +172,10 @@ class VefaasDeploymentConfig(BaseModel):
 
 
 DeployConfig: TypeAlias = Annotated[
-    VefaasDeploymentConfig | LocalDeploymentConfig | HostDeploymentConfig | ModalDeploymentConfig,
+    VefaasDeploymentConfig
+    | LocalDeploymentConfig
+    | HostDeploymentConfig
+    | ModalDeploymentConfig
+    | YrDeploymentConfig,
     Field(discriminator="type"),
 ]

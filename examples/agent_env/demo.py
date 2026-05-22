@@ -60,8 +60,17 @@ elif impl == "modal":
         "runtime_timeout": 300.0,
         "deployment_timeout": 3600.0,
     }
+elif impl == "yr":
+    assert os.getenv("AKERNEL_SERVER_ADDRESS") is not None, "AKERNEL_SERVER_ADDRESS must be set"
+    assert os.getenv("AKERNEL_TOKEN") is not None, "AKERNEL_TOKEN must be set"
+    deployment_config = {
+        "type": "yr",
+        "image": os.getenv("AKERNEL_DEPLOYMENT_IMAGE", "python:3.12"),
+        "timeout": float(os.getenv("AKERNEL_DEPLOYMENT_TIMEOUT", "300")),
+        "startup_timeout": float(os.getenv("AKERNEL_DEPLOYMENT_STARTUP_TIMEOUT", "180")),
+    }
 elif impl == "":
-    raise ValueError("DEPLOYMENT must be set")
+    raise ValueError("DEPLOYMENT must be set (local, vefaas, modal, yr)")
 else:
     raise ValueError(f"Invalid environment implementation: {impl}")
 

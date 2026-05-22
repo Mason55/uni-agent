@@ -1,5 +1,6 @@
 import asyncio
 import shutil
+import ssl
 import sys
 import tempfile
 import traceback
@@ -50,6 +51,8 @@ class RemoteRuntimeConfig(BaseModel):
     """Extra parameters for remote runtime connection (for VEFAAS)."""
     proxy: str | None = None
     """The proxy to use for the http/https connection."""
+    ssl_verify: bool = True
+    """Verify TLS certificates for https connections. Set False for self-signed test clusters."""
 
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
@@ -88,6 +91,20 @@ class RemoteRuntime(AbstractRuntime):
         if timeout is None:
             return self._config.timeout
         return timeout
+
+    def _make_connector(self) -> aiohttp.TCPConnector:
+        if self._config.ssl_verify:
+            return aiohttp.TCPConnector(force_close=True)
+        return aiohttp.TCPConnector(force_close=True, ssl=False)
+
+    def _client_session_kwargs(self, *, timeout: float | None = None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "connector": self._make_connector(),
+            "proxy": self._config.proxy,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
+        return kwargs
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -160,14 +177,11 @@ class RemoteRuntime(AbstractRuntime):
         together with the message.
         """
         try:
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(force_close=True), proxy=self._config.proxy
-            ) as session:
-                timeout = self._get_timeout(timeout)
+            timeout = self._get_timeout(timeout)
+            async with aiohttp.ClientSession(**self._client_session_kwargs(timeout=timeout)) as session:
                 async with session.get(
                     f"{self._api_url}/is_alive",
                     headers=self._headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
@@ -217,18 +231,11 @@ class RemoteRuntime(AbstractRuntime):
 
         while num_retries >= 0 and client_error_retries >= 0:
             try:
-                connector = aiohttp.TCPConnector(force_close=True)
-                session_kwargs = {
-                    "connector": connector,
-                    "timeout": aiohttp.ClientTimeout(total=timeout),
-                    "proxy": self._config.proxy,
-                }
-                async with aiohttp.ClientSession(**session_kwargs) as session:
+                async with aiohttp.ClientSession(**self._client_session_kwargs(timeout=timeout)) as session:
                     async with session.post(
                         request_url,
                         json=payload.model_dump() if payload else None,
                         headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as resp:
                         await self._handle_response_errors(resp)
                         return output_class(**await resp.json())
@@ -278,13 +285,7 @@ class RemoteRuntime(AbstractRuntime):
         source = Path(request.source_path).resolve()
         self.logger.debug(f"Uploading file from {source} to {request.target_path}")
 
-        connector = aiohttp.TCPConnector(force_close=True)
-        session_kwargs = {
-            "connector": connector,
-            "proxy": self._config.proxy,
-        }
-
-        async with aiohttp.ClientSession(**session_kwargs) as session:
+        async with aiohttp.ClientSession(**self._client_session_kwargs()) as session:
             if source.is_dir():
                 # Ignore cleanup errors: See https://github.com/SWE-agent/SWE-agent/issues/1005
                 with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:

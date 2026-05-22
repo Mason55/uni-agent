@@ -6,6 +6,7 @@ from .config import (
     LocalDeploymentConfig,
     ModalDeploymentConfig,
     VefaasDeploymentConfig,
+    YrDeploymentConfig,
 )
 
 _LAZY_EXPORTS = {
@@ -13,6 +14,7 @@ _LAZY_EXPORTS = {
     "LocalDeployment": ".local.deployment",
     "ModalDeployment": ".modal.deployment",
     "VefaasDeployment": ".vefaas.deployment",
+    "YrDeployment": ".yr.deployment",
 }
 
 __all__ = [
@@ -21,10 +23,12 @@ __all__ = [
     "LocalDeploymentConfig",
     "ModalDeploymentConfig",
     "VefaasDeploymentConfig",
+    "YrDeploymentConfig",
     "HostDeployment",
     "LocalDeployment",
     "ModalDeployment",
     "VefaasDeployment",
+    "YrDeployment",
 ]
 
 

@@ -12,14 +12,27 @@ from swerex.runtime.abstract import CreateBashSessionRequest, IsAliveResponse
 from swerex.utils.wait import _wait_until_alive
 
 from uni_agent.async_logging import get_logger
-from uni_agent.deployment.config import YrDeploymentConfig
+from uni_agent.deployment.config import YRDeploymentConfig
 from uni_agent.deployment.remote_runtime import RemoteRuntime, RemoteRuntimeConfig
 
-__all__ = ["YrDeployment"]
+__all__ = ["YRDeployment"]
 
 
-def _create_sandbox(config: YrDeploymentConfig) -> Any:
+def _configure_env() -> None:
+    """Map OPENYUANRONG_* env vars to names required by akernel-sdk before use."""
+    server = os.getenv("OPENYUANRONG_SERVER_ADDRESS")
+    token = os.getenv("OPENYUANRONG_TOKEN")
+    if not server:
+        raise ValueError("OPENYUANRONG_SERVER_ADDRESS environment variable must be set")
+    if not token:
+        raise ValueError("OPENYUANRONG_TOKEN environment variable must be set")
+    os.environ["AKERNEL_SERVER_ADDRESS"] = server
+    os.environ["AKERNEL_TOKEN"] = token
+
+
+def _create_sandbox(config: YRDeploymentConfig) -> Any:
     """Create sandbox with port_forwardings=[port] (Port Forwarding, sandbox-api)."""
+    _configure_env()
     from akernel_sdk import Sandbox
 
     kwargs: dict[str, Any] = {
@@ -59,12 +72,12 @@ def _kill_sandbox(sandbox: Any) -> None:
     sandbox.kill()
 
 
-class YrDeployment(AbstractDeployment):
-    """YR deployment: AKernel sandbox + Port Forwarding + swe-rex + RemoteRuntime."""
+class YRDeployment(AbstractDeployment):
+    """YR (AKernel) deployment: sandbox + Port Forwarding + swe-rex + RemoteRuntime."""
 
     def __init__(self, run_id: str, **kwargs: Any):
         self.run_id = run_id
-        self._config = YrDeploymentConfig(**kwargs)
+        self._config = YRDeploymentConfig(**kwargs)
         self._runtime: RemoteRuntime | None = None
         self._sandbox: Any | None = None
         self._command_handle: Any | None = None
@@ -74,16 +87,11 @@ class YrDeployment(AbstractDeployment):
         self._hooks = CombinedDeploymentHook()
         self._stopped = False
 
-        if not os.getenv("AKERNEL_SERVER_ADDRESS"):
-            raise ValueError("AKERNEL_SERVER_ADDRESS environment variable must be set")
-        if not os.getenv("AKERNEL_TOKEN"):
-            raise ValueError("AKERNEL_TOKEN environment variable must be set")
-
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
 
     @classmethod
-    def from_config(cls, config: YrDeploymentConfig, run_id: str | None = None) -> Self:
+    def from_config(cls, config: YRDeploymentConfig, run_id: str | None = None) -> Self:
         if run_id is None:
             run_id = str(uuid.uuid4())
         return cls(run_id=run_id, **config.model_dump())
@@ -96,9 +104,12 @@ class YrDeployment(AbstractDeployment):
         if self._config.command:
             return self._config.command.format(token=token, port=self._port)
         rex_args = f"--host 0.0.0.0 --port {self._port} --auth-token {token}"
-        # command to prepare environment, such as pip config, install etc.
-        if os.getenv("ENV_PREPARE_CMD"):
-            return f"{os.getenv('ENV_PREPARE_CMD')} && ({REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args})"
+        prepare_cmd = os.getenv("OPENYUANRONG_ENV_PREPARE_CMD")
+        if prepare_cmd:
+            return (
+                f"{prepare_cmd} && "
+                f"({REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args})"
+            )
         return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args}"
 
     async def is_alive(self, *, timeout: float | None = None) -> IsAliveResponse:

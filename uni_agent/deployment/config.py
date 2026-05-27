@@ -95,7 +95,7 @@ class ModalDeploymentConfig(BaseModel):
         return ModalDeployment.from_config(self, run_id)
 
 
-class YrDeploymentConfig(BaseModel):
+class YRDeploymentConfig(BaseModel):
     """Configuration for YR (AKernel) remote sandbox deployment."""
 
     image: str | None = None
@@ -133,14 +133,14 @@ class YrDeploymentConfig(BaseModel):
     sandbox_kwargs: dict[str, Any] = Field(default_factory=dict)
     """Extra keyword arguments passed to akernel_sdk.Sandbox."""
 
-    type: Literal["yr"] = "yr"
+    type: Literal["openyuanrong"] = "openyuanrong"
     """Discriminator for (de)serialization/CLI. Do not change."""
     model_config = ConfigDict(extra="forbid")
 
     def get_deployment(self, run_id: str):
-        from .yr.deployment import YrDeployment
+        from .openyuanrong.deployment import YRDeployment
 
-        return YrDeployment.from_config(self, run_id)
+        return YRDeployment.from_config(self, run_id)
 
 
 class VefaasDeploymentConfig(BaseModel):
@@ -176,6 +176,6 @@ DeployConfig: TypeAlias = Annotated[
     | LocalDeploymentConfig
     | HostDeploymentConfig
     | ModalDeploymentConfig
-    | YrDeploymentConfig,
+    | YRDeploymentConfig,
     Field(discriminator="type"),
 ]

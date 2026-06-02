@@ -78,10 +78,6 @@ class SWEAgentFramework(OpenAICompatibleAgentFramework):
             await self.session_runtime.complete_session(
                 session_id, reward_info=reward_info,
             )
-            if self.wait_for_completion_after_agent_run:
-                await self.session_runtime.wait_for_completion(
-                    session_id, timeout=self.completion_timeout,
-                )
             session_trajectories = await self.session_runtime.finalize_session(session_id)
 
         except Exception:

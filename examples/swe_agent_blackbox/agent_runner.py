@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import socket
-import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -27,23 +25,6 @@ from examples.swe_agent_blackbox.reward import build_reward_context, evaluate_in
 logger = logging.getLogger(__name__)
 if os.environ.get("DEBUG_MODE"):
     logger.setLevel(logging.DEBUG)
-
-_port_counter = 10000
-_port_lock = threading.Lock()
-
-
-def _allocate_port() -> int:
-    global _port_counter
-    with _port_lock:
-        while True:
-            port = _port_counter
-            _port_counter += 1
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                try:
-                    sock.bind(("127.0.0.1", port))
-                    return port
-                except OSError:
-                    continue
 
 
 # =====================================================================
@@ -87,11 +68,7 @@ def _create_agent_env(run_id: str, tools_kwargs: dict, agent_config: dict) -> Ag
             )
         env_config["deployment"] = deployment
         env_config.update(env_override)
-    # Pre-allocate a unique port to avoid _pick_free_port race conditions
-    # when multiple sessions start concurrently.
     deployment = dict(env_config.get("deployment", {}))
-    if "published_port" not in deployment:
-        deployment["published_port"] = _allocate_port()
     env_config["deployment"] = deployment
     return AgentEnv(run_id=run_id, env_config=AgentEnvConfig(**env_config))
 

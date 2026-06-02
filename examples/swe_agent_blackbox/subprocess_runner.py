@@ -16,9 +16,6 @@ from typing import Any
 import ray
 
 
-# ──────────── Stub objects ────────────
-
-
 @dataclass
 class _StubSessionHandle:
     """Transparent SessionHandle replacement for agent_runner.
@@ -54,9 +51,6 @@ class _StubSessionRuntime:
 
     async def wait_for_completion(self, session_id: str, timeout: float | None = None) -> None:
         pass
-
-
-# ──────────── Remote function ────────────
 
 
 @ray.remote(num_cpus=0)

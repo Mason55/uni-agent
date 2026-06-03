@@ -23,7 +23,7 @@ elif impl == "openyuanrong":
         parts = instance_id.split("__")
         assert len(parts) == 2
         instance_number = parts[1].lower()
-        return f"swr.cn-east-3.myhuaweicloud.com/openyuanrong/sr2e-gym-subset/{instance_number}:latest"
+        return f"swr.cn-east-3.myhuaweicloud.com/openyuanrong/r2e-gym-subset/{instance_number}:latest"
 else:
     raise ValueError(f"Invalid deployment implementation: {impl}")
 

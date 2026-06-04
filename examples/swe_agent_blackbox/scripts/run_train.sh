@@ -21,19 +21,19 @@ NNODES="${NNODES:-1}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-8}"
 
 # ── Training parameters ─────────────────────────────────────────────────
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
 PROMPT_LENGTH="${PROMPT_LENGTH:-4096}"
-RESPONSE_LENGTH="${RESPONSE_LENGTH:-4096}"
-ACTOR_LR="${ACTOR_LR:-3e-4}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-30}"
-SAVE_FREQ="${SAVE_FREQ:-5}"
-TEST_FREQ="${TEST_FREQ:-5}"
+RESPONSE_LENGTH="${RESPONSE_LENGTH:-131072}"
+ACTOR_LR="${ACTOR_LR:-1e-6}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
+TEST_FREQ="${TEST_FREQ:-10}"
 
 # ── Rollout parameters ──────────────────────────────────────────────────
 ENGINE="${ENGINE:-vllm}"
 TP="${TP:-4}"
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
-N="${N:-1}"
+ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.7}"
+N="${N:-8}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 
 # ── Agent parameters ─────────────────────────────────────────────────────
@@ -53,7 +53,6 @@ export VERL_LOGGING_LEVEL
 # ── Environment for NCCL ─────────────────────────────────────────────────
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
-export TRANSFORMERS_ATTN_IMPLEMENTATION="${TRANSFORMERS_ATTN_IMPLEMENTATION:-eager}"
 
 echo "=== SWE-Agent Blackbox Training ==="
 echo "Model:       ${MODEL_PATH}"

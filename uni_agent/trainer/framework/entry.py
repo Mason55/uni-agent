@@ -1,15 +1,19 @@
-"""Factory entry + trainer-facing adapter for the agent framework stack.
+"""Factory entry + trainer-facing adapters for the agent framework stack.
 
 `build_agent_framework` owns gateway-universal wiring so framework subclasses
 only handle their own agent runner, reward dispatch, and framework-specific
 config fields.
 
-`AgentFrameworkRolloutAdapter` satisfies the trainer's
+`AgentFrameworkRolloutAdapter` satisfies the sync trainer's
 `agent_loop_manager_class` extension-point contract; recipes wire it in via
 yaml without authoring per-recipe glue:
 
     actor_rollout_ref.rollout.agent.agent_loop_manager_class:
         uni_agent.trainer.framework.entry.AgentFrameworkRolloutAdapter
+
+`FullyAsyncAgentFrameworkRolloutAdapter` satisfies the fully-async rollouter's
+`agent_loop_manager_class` contract; it writes directly to TransferQueue
+instead of relying on a local ReplayBuffer.
 """
 
 from __future__ import annotations
@@ -105,4 +109,48 @@ class AgentFrameworkRolloutAdapter:
     async def generate_sequences(self, prompts) -> None:
         if self.framework is None:
             raise RuntimeError("framework must be initialized before generate_sequences")
+        return await self.framework.generate_sequences(prompts)
+
+
+class FullyAsyncAgentFrameworkRolloutAdapter:
+    """Async-rollouter adapter for agent frameworks (Gateway + subprocess runner).
+
+    Satisfies the fully-async rollouter's ``agent_loop_manager_class`` contract.
+    The ``llm_client`` injected by the rollouter is a
+    :class:`FullyAsyncLLMServerClient`, so the Gateway automatically gains
+    partial rollout resume capability — weight-sync interruptions are
+    transparent to the subprocess agent_runner.
+    """
+
+    def __init__(self) -> None:
+        self.framework = None
+
+    @classmethod
+    @auto_await
+    async def create(
+        cls,
+        *,
+        config,
+        llm_client,
+        teacher_client=None,
+        reward_loop_worker_handles=None,
+        **_,
+    ) -> "FullyAsyncAgentFrameworkRolloutAdapter":
+        del teacher_client
+        framework = await build_agent_framework(
+            config=config,
+            llm_client=llm_client,
+            replay_buffer=None,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        instance = cls()
+        instance.framework = framework
+        return instance
+
+    async def generate_sequences_single(self, prompts):
+        """TQ async path entry — writes to TransferQueue, returns None."""
+        return await self.framework.generate_sequences(prompts)
+
+    async def generate_sequences(self, prompts):
+        """Compatibility entry for validation path."""
         return await self.framework.generate_sequences(prompts)

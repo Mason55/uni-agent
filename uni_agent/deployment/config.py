@@ -158,13 +158,13 @@ class YRDeploymentConfig(BaseModel):
 
     image: str | None = None
     """Docker image URL for the sandbox. Uses the default runtime image when unset."""
-    cpu: int = 2000
+    cpu: int = 1000
     """CPU request in milli-cores."""
-    memory: int = 4096
+    memory: int = 2048
     """Memory request in MiB."""
-    cpu_limit: int = 0
+    cpu_limit: int = 4000
     """CPU cgroup limit in milli-cores. 0 means equal to cpu."""
-    mem_limit: int = 0
+    mem_limit: int = 8192
     """Memory cgroup limit in MiB. 0 means equal to memory."""
     idle_timeout: int = 600
     """Idle timeout in seconds before auto-termination."""

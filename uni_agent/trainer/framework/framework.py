@@ -209,8 +209,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
     async def generate_sequences(self, prompts: TensorDict) -> None:
         """Run rollout-manager generation and write outputs into TransferQueue."""
-        if self._replay_buffer is None:
-            raise RuntimeError("OpenAICompatibleAgentFramework requires replay_buffer for generate_sequences")
+        if self._replay_buffer is None and self._rollout_config is None:
+            raise RuntimeError("OpenAICompatibleAgentFramework requires replay_buffer or rollout_config for generate_sequences")
         if self._rollout_config is None:
             raise RuntimeError("OpenAICompatibleAgentFramework requires rollout_config for generate_sequences")
 
@@ -229,10 +229,11 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         if uids is None:
             raise ValueError("OpenAICompatibleAgentFramework requires prompts['uid'] for replay_buffer")
         uid_values = uids.tolist() if hasattr(uids, "tolist") else list(uids)
-        self._replay_buffer.add(
-            partition_id,
-            {str(uid): {"global_steps": global_steps, "status": "running"} for uid in uid_values},
-        )
+        if self._replay_buffer is not None:
+            self._replay_buffer.add(
+                partition_id,
+                {str(uid): {"global_steps": global_steps, "status": "running"} for uid in uid_values},
+            )
 
         stats = await self._run_batch_to_tq(
             prompts,
@@ -526,6 +527,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 sample_fields=sample_fields,
                 session_index=session_index,
                 global_steps=global_steps,
+                uid=uid,
             )
             keys.append(f"{uid}_{session_index}_{index}")
             fields.append(field)
@@ -545,6 +547,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         sample_fields: dict[str, object],
         session_index: int,
         global_steps: int,
+        uid: str = "",
     ) -> tuple[dict[str, object], dict[str, object]]:
         prompts = torch.tensor(trajectory.prompt_ids, dtype=torch.long)
         responses = torch.tensor(trajectory.response_ids, dtype=torch.long)
@@ -608,6 +611,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             "prompt_len": prompt_len,
             "response_len": response_len,
             "seq_len": prompt_len + response_len,
+            "uid": uid,
         }
         return field, tag
 

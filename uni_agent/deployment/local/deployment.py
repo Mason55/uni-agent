@@ -292,11 +292,11 @@ class LocalDeployment(AbstractDeployment):
 
     async def start(self, max_retries: int = 5) -> None:
         token = self._get_token()
-        published_port = self._config.published_port or _pick_free_port()
         container_name = self._config.container_name or f"uni-agent-{_sanitize_name(self.run_id)}"
         self._stopped = False
         last_error: Exception | None = None
         for attempt in range(max_retries):
+            published_port = self._config.published_port or _pick_free_port()
             self._stopped = False
             self.logger.info(
                 f"Starting local deployment with runtime={self._config.container_runtime}, image={self._config.image}."

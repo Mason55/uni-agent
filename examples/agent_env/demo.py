@@ -82,6 +82,7 @@ elif impl == "openyuanrong":
         "image": os.getenv("OPENYUANRONG_DEPLOYMENT_IMAGE", "python:3.12"),
         "timeout": float(os.getenv("OPENYUANRONG_DEPLOYMENT_TIMEOUT", "300")),
         "startup_timeout": float(os.getenv("OPENYUANRONG_DEPLOYMENT_STARTUP_TIMEOUT", "180")),
+        # "proxy": "",
     }
 elif impl == "":
     raise ValueError("DEPLOYMENT must be set (local, vefaas, modal, openyuanrong)")

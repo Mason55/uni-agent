@@ -1,114 +1,81 @@
 """Mini-swe-agent runner for the blackbox SWE-agent recipe.
 
-Uses third-party minisweagent components (DefaultAgent, DockerEnvironment,
-LitellmModel) with gateway-based LLM routing. Computes reward in-process
-and passes it via the gateway's complete_session endpoint.
+In-sandbox execution model: mini-swe-agent is mounted as a sidecar tool image
+into the sandbox and runs *inside* the sandbox using LocalEnvironment (local
+bash). The external runner creates the sandbox, triggers the agent, and
+evaluates reward — all through the unified ``SandboxCommands`` interface.
+
+Task config is piped to run_agent.py via stdin (base64 encoded to avoid shell
+escaping issues). Result JSON is returned via stdout (logging goes to stderr).
+This eliminates extra file write/read round trips.
+
+Supported sandbox types:
+  - ``"local"``: local Docker with sidecar bind-mount
+  - ``"openyuanrong"``: remote YR sandbox with akernel_sdk.Mount
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import json
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
 
 from uni_agent.trainer.framework.types import SessionHandle, SessionRuntime
 
 from examples.swe_agent_blackbox.dataset import extract_image
 from examples.swe_agent_blackbox.reward import build_reward_context, evaluate_in_env
+from examples.swe_agent_blackbox.sandbox import CommandResult
 
 logger = logging.getLogger(__name__)
 if os.environ.get("DEBUG_MODE"):
     logger.setLevel(logging.DEBUG)
 
-try:
-    import shlex
-    import subprocess
-    import uuid as _uuid
 
-    from minisweagent.agents.default import DefaultAgent
-    from minisweagent.config import builtin_config_dir, get_config_from_spec
-    from minisweagent.environments.docker import DockerEnvironment
-    from minisweagent.models.litellm_model import LitellmModel
-
-    _SWEBENCH_CONFIG = get_config_from_spec(str(builtin_config_dir / "benchmarks" / "swebench.yaml"))
-except ImportError:
-    _SWEBENCH_CONFIG = None
+# Default sidecar image — user can change this or set MINI_SWE_AGENT_IMAGE env var.
+MINI_SWE_AGENT_IMAGE = os.environ.get("MINI_SWE_AGENT_IMAGE", "mini-swe-agent-tool:latest")
 
 
-class _FixedCmdDockerEnvironment(DockerEnvironment):
-    """DockerEnvironment subclass that adapts CMD to the image's ENTRYPOINT.
+async def _create_sandbox(
+    *,
+    image: str,
+    sandbox_type: str,
+    sidecar_image: str = MINI_SWE_AGENT_IMAGE,
+):
+    """Create a sandbox with the mini-swe-agent sidecar tool mounted."""
+    if sandbox_type == "local":
+        from examples.swe_agent_blackbox.sandbox.docker_sandbox import DockerSandboxCommands
 
-    Background:
-        DockerEnvironment._start_container hardcodes CMD as ["sleep", timeout].
-        This works for images whose ENTRYPOINT exec's CMD directly (e.g.
-        nvidia_entrypoint.sh), but fails for images whose ENTRYPOINT is
-        "/bin/bash" because "/bin/bash sleep 2h" causes bash to interpret
-        the /usr/bin/sleep ELF binary as a shell script and immediately exit
-        with "cannot execute binary file" (exit 126).
+        return await DockerSandboxCommands.create(image=image, sidecar_image=sidecar_image)
+    elif sandbox_type == "openyuanrong":
+        from examples.swe_agent_blackbox.sandbox.yr_sandbox import YRSandboxCommands
 
-    Fix:
-        Inspect the image's ENTRYPOINT at startup.  If it ends with "bash",
-        use ["-lc", "sleep <timeout>"] as CMD (matching the image's intended
-        format).  Otherwise, use the original ["sleep", "<timeout>"].
+        return await YRSandboxCommands.create(image=image, sidecar_image=sidecar_image)
+    else:
+        raise ValueError(f"Unknown sandbox_type={sandbox_type!r}. Supported: 'local', 'openyuanrong'")
+
+# =====================================================================
+# SandboxEnvForReward — adapts SandboxCommands to reward spec interface
+# =====================================================================
+
+
+class SandboxEnvForReward:
+    """Adapts :class:`SandboxCommands` to the async env interface used by
+    reward specs (``communicate``, ``write_file``, ``read_file``).
+
+    Drop-in replacement for the old ``DockerEnvForReward``.
     """
 
-    def _start_container(self):
-        container_name = f"minisweagent-{_uuid.uuid4().hex[:8]}"
-        entrypoint = self._detect_entrypoint()
-        if entrypoint and entrypoint.endswith("bash"):
-            cmd_suffix = ["-lc", f"sleep {self.config.container_timeout}"]
-        else:
-            cmd_suffix = ["sleep", self.config.container_timeout]
-        cmd = [
-            self.config.executable, "run", "-d",
-            "--name", container_name,
-            "-w", self.config.cwd,
-            *self.config.run_args,
-            self.config.image,
-            *cmd_suffix,
-        ]
-        self.logger.debug("Starting container with command: %s", shlex.join(cmd))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=self.config.pull_timeout, check=True,
-        )
-        self.logger.info("Started container %s with ID %s", container_name, result.stdout.strip())
-        self.container_id = result.stdout.strip()
-
-    def _detect_entrypoint(self) -> str | None:
-        """Detect the image's ENTRYPOINT via docker inspect."""
-        try:
-            result = subprocess.run(
-                [self.config.executable, "inspect", self.config.image, "--format", "{{.Config.Entrypoint}}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            ep = result.stdout.strip().strip("[]\"")
-            return ep if ep else None
-        except Exception:
-            return None
-
-
-# =====================================================================
-# DockerEnvForReward: adapts sync DockerEnvironment to async interface
-# =====================================================================
-
-
-class DockerEnvForReward:
-    """Adapts minisweagent's sync DockerEnvironment to async interface for reward specs."""
-
-    def __init__(self, docker_env):
-        self._env = docker_env
+    def __init__(self, sandbox):
+        self._sandbox = sandbox
 
     async def communicate(self, input: str, timeout=60, check="ignore", error_msg="Command failed") -> str:
-        result = await asyncio.to_thread(self._env.execute, {"command": input}, timeout=int(timeout))
-        output, rc = result.get("output", ""), result.get("returncode", 0)
-        if check == "raise" and rc != 0:
-            raise RuntimeError(f"{error_msg}: {output[:200]}")
-        return output
+        result = await self._sandbox.run(input, timeout=int(timeout))
+        if check == "raise" and result.exit_code != 0:
+            raise RuntimeError(f"{error_msg}: {result.stdout[:200]}")
+        return result.stdout
 
     async def write_file(self, path: str | Path, content: str) -> None:
         encoded = base64.b64encode(content.encode()).decode()
@@ -116,6 +83,38 @@ class DockerEnvForReward:
 
     async def read_file(self, path: str | Path, **_) -> str:
         return await self.communicate(f"cat {path}")
+
+
+# =====================================================================
+# Task config builder
+# =====================================================================
+
+
+def _extract_task(raw_prompt) -> str:
+    """Extract task text from raw_prompt (str or message list)."""
+    if isinstance(raw_prompt, str):
+        return raw_prompt
+    return next(
+        (m["content"] for m in raw_prompt if isinstance(m, dict) and m.get("role") == "user"),
+        str(raw_prompt),
+    )
+
+
+def _build_task_config(
+    *,
+    task: str,
+    gateway_url: str,
+    agent_step_limit: int = 250,
+) -> dict:
+    """Build the task config passed to run_agent.py via stdin."""
+    return {
+        "task": task,
+        "gateway_url": gateway_url,
+        "agent": {
+            "step_limit": agent_step_limit,
+            "cost_limit": 0,
+        },
+    }
 
 
 # =====================================================================
@@ -132,85 +131,92 @@ async def mini_swe_agent_runner(
     tools_kwargs: dict | None = None,
     **kwargs,
 ) -> None:
-    """Run mini-swe-agent's DefaultAgent through the gateway with in-process reward."""
-    if _SWEBENCH_CONFIG is None:
-        raise ImportError("minisweagent is required for mini_swe_agent_runner")
+    """Run mini-swe-agent inside a sandbox with sidecar tool mount.
 
+    Flow:
+        1. Create sandbox (Docker or YR) with mini-swe-agent sidecar
+        2. Pipe task config to run_agent.py via stdin
+        3. Parse agent result from stdout
+        4. Evaluate reward in the same sandbox
+        5. Complete session with reward_info
+    """
     tools_kwargs = tools_kwargs or {}
     logger.info("mini_swe_agent_runner called, sample_index=%d", sample_index)
 
     # 1. Extract task text
-    task = raw_prompt if isinstance(raw_prompt, str) else next(
-        (m["content"] for m in raw_prompt if isinstance(m, dict) and m.get("role") == "user"),
-        str(raw_prompt),
-    )
+    task = _extract_task(raw_prompt)
     logger.info("task extracted, %d chars", len(task))
 
-    # 2. Create DockerEnvironment
+    # 2. Dataset config (image from parquet)
     env_config = tools_kwargs.get("env", {})
     image = extract_image(env_config)
     if not image:
         raise ValueError(f"No Docker image found in tools_kwargs.env for sample {sample_index}")
 
-    env_cfg = dict(_SWEBENCH_CONFIG.get("environment", {}))
-    env_cfg.pop("environment_class", None)
-    env_cfg["image"] = image
-    env_cfg["container_timeout"] = "2h"
-    env_cfg.setdefault("env", {})["GIT_PAGER"] = "cat"
-    docker_env = _FixedCmdDockerEnvironment(**env_cfg)
+    # 3. Sandbox deployment config (hardcoded + global env var)
+    sandbox_type = os.environ.get("SWE_AGENT_SANDBOX_TYPE", "local")
 
-    # 2b. Run post_setup_cmd if provided
-    post_setup_cmd = env_config.get("post_setup_cmd", "")
-    if post_setup_cmd:
-        logger.info("Running post_setup_cmd (%d chars)...", len(post_setup_cmd))
-        result = docker_env.execute({"command": post_setup_cmd}, timeout=120)
-        rc = result.get("returncode", 0)
-        if rc != 0:
-            logger.warning("post_setup_cmd failed (rc=%d): %s", rc, result.get("output", "")[:200])
-        else:
-            logger.info("post_setup_cmd done")
+    sandbox = await _create_sandbox(
+        image=image,
+        sandbox_type=sandbox_type,
+        sidecar_image=MINI_SWE_AGENT_IMAGE,
+    )
+    logger.info("Sandbox created (type=%s, image=%s)", sandbox_type, image)
 
-    # 3. Prepare metadata
-    metadata, eval_timeout = build_reward_context(tools_kwargs)
+    # 4. Build task config — gateway URL comes directly from session
+    step_limit = int(os.environ.get("SWE_AGENT_MAX_TURNS", "250"))
+    task_config = _build_task_config(
+        task=task,
+        gateway_url=session.base_url or "",
+        agent_step_limit=step_limit,
+    )
 
     try:
-        # 4. Create LitellmModel pointing at gateway
-        model_cfg = dict(_SWEBENCH_CONFIG.get("model", {}))
-        model_cfg.update({
-            "model_name": "openai/default",
-            "model_kwargs": {
-                "api_base": session.base_url,
-                "api_key": "not-needed",
-                "drop_params": True,
-            },
-            "cost_tracking": "ignore_errors",
-        })
-        model = LitellmModel(**model_cfg)
+        # 5. Run post_setup_cmd if provided
+        post_setup_cmd = env_config.get("post_setup_cmd", "")
+        if post_setup_cmd:
+            logger.info("Running post_setup_cmd (%d chars)...", len(post_setup_cmd))
+            r = await sandbox.run(post_setup_cmd, timeout=120)
+            if r.exit_code != 0:
+                logger.warning("post_setup_cmd failed (rc=%d): %s", r.exit_code, r.stdout[:200])
+            else:
+                logger.info("post_setup_cmd done")
 
-        # 5. Create DefaultAgent
-        agent_cfg = dict(_SWEBENCH_CONFIG.get("agent", {}))
-        agent_cfg["step_limit"] = int(os.environ.get("SWE_AGENT_MAX_TURNS", str(agent_cfg.get("step_limit", 250))))
-        agent_cfg["cost_limit"] = 0
-        logger.debug("[sample %d] step_limit=%d", sample_index, agent_cfg["step_limit"])
-        agent = DefaultAgent(model, docker_env, **agent_cfg)
-
-        # 6. Run agent in thread (DefaultAgent is synchronous)
-        logger.debug("[sample %d] starting agent run", sample_index)
+        # 6. Run agent inside sandbox — pipe config via stdin, read result from stdout
+        #    base64 encode the config JSON to avoid shell escaping issues
+        config_b64 = base64.b64encode(json.dumps(task_config).encode()).decode()
+        agent_cmd = (
+            f"echo {config_b64} | base64 -d | "
+            "/opt/mini-swe-agent/bin/python /opt/mini-swe-agent/bin/run_agent.py"
+        )
+        logger.debug("[sample %d] starting agent inside sandbox", sample_index)
         t0 = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, lambda: agent.run(task=task))
+        agent_result = await sandbox.run(agent_cmd, timeout=1800)
+        elapsed = time.perf_counter() - t0
+        logger.debug(
+            "[sample %d] agent process finished: rc=%d (%.1fs)",
+            sample_index, agent_result.exit_code, elapsed,
+        )
 
-        exit_status = info.get("exit_status", "unknown")
-        submission = info.get("submission", "")
-        logger.debug("[sample %d] agent finished: exit_status=%s, steps=%d (%.1fs)", sample_index, exit_status, agent.n_calls, time.perf_counter() - t0)
+        # 7. Parse result from stdout (last non-empty line is the result JSON)
+        agent_info = _parse_agent_result(agent_result.stdout, sample_index)
+        logger.info(
+            "[sample %d] agent: exit_status=%s, submission=%d chars",
+            sample_index, agent_info.get("exit_status"),
+            len(agent_info.get("submission", "")),
+        )
 
-        # 7. Evaluate reward
+        # 8. Evaluate reward (external, in the same sandbox)
+        metadata, eval_timeout = build_reward_context(tools_kwargs)
         t0 = time.perf_counter()
-        reward_env = DockerEnvForReward(docker_env)
+        reward_env = SandboxEnvForReward(sandbox)
         score, eval_result = await evaluate_in_env(reward_env, metadata, eval_timeout)
-        logger.debug("[sample %d] reward done: score=%s, resolved=%s (%.1fs)", sample_index, score, eval_result.get("resolved"), time.perf_counter() - t0)
+        logger.debug(
+            "[sample %d] reward done: score=%s, resolved=%s (%.1fs)",
+            sample_index, score, eval_result.get("resolved"), time.perf_counter() - t0,
+        )
 
-        # 8. Signal completion with reward_info
+        # 9. Signal completion with reward_info
         reward_info = {"reward_score": score, **eval_result}
         await session_runtime.complete_session(session.session_id, reward_info=reward_info)
 
@@ -219,6 +225,18 @@ async def mini_swe_agent_runner(
         raise
     finally:
         try:
-            docker_env.cleanup()
+            await sandbox.cleanup()
         except Exception:
             pass
+
+
+def _parse_agent_result(stdout: str, sample_index: int) -> dict:
+    """Parse agent result JSON from run_agent.py stdout."""
+    stdout = stdout.strip()
+    if not stdout:
+        return {"exit_status": "error", "submission": ""}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        logger.warning("[sample %d] Failed to parse agent result: %s", sample_index, stdout[:200])
+        return {"exit_status": "error", "submission": ""}

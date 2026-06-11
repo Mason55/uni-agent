@@ -1,7 +1,9 @@
 import asyncio
 import os
+import shlex
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Self
 
 from swerex import PACKAGE_NAME, REMOTE_EXECUTABLE_NAME
@@ -16,6 +18,8 @@ from uni_agent.deployment.config import YRDeploymentConfig
 from uni_agent.deployment.remote_runtime import RemoteRuntime, RemoteRuntimeConfig
 
 __all__ = ["YRDeployment"]
+
+DEFAULT_SWEREX_REMOTE_LOG_PATH = "./swerex-remote.log"
 
 
 def _configure_env() -> None:
@@ -62,14 +66,55 @@ def _create_sandbox(config: YRDeploymentConfig) -> Any:
     return Sandbox(**kwargs)
 
 
-def _start_swerex_via_port_forwarding(sandbox: Any, *, command: str, port: int, internal: bool) -> tuple[Any, str]:
+def _swerex_remote_log_path() -> str:
+    return os.getenv("OPENYUANRONG_SWEREX_REMOTE_LOG_PATH", DEFAULT_SWEREX_REMOTE_LOG_PATH).strip()
+
+
+def _local_swerex_log_dir() -> Path:
+    configured = os.getenv("OPENYUANRONG_SWEREX_LOCAL_LOG_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    run_infer = Path.cwd() / "examples/swe_agent_blackbox/scripts/run_infer.sh"
+    if run_infer.exists():
+        return run_infer.parent
+    return Path.cwd()
+
+
+def _write_local_startup_diagnostics(run_id: str, diagnostics: Any) -> Path:
+    safe_run_id = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in run_id)
+    output_dir = _local_swerex_log_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"swerex-startup-diagnostics-{safe_run_id}.log"
+    output_path.write_text(
+        "OpenYuanRong runtime startup diagnostics\n"
+        f"exit_code={getattr(diagnostics, 'exit_code', None)}\n\n"
+        "stdout:\n"
+        f"{getattr(diagnostics, 'stdout', '')}\n\n"
+        "stderr:\n"
+        f"{getattr(diagnostics, 'stderr', '')}\n",
+        encoding="utf-8",
+    )
+    return output_path
+
+
+def _start_swerex_via_port_forwarding(
+    sandbox: Any,
+    *,
+    command: str,
+    port: int,
+    internal: bool,
+    log_path: str | None = None,
+) -> tuple[Any, str]:
     """Port Forwarding flow from sandbox-api.md:
 
     1. Sandbox created with port_forwardings=[port]
     2. commands.run(server_cmd, background=True)  — start swerex on the forwarded port
     3. get_port_url(port) — gateway URL for RemoteRuntime
     """
-    handle = sandbox.commands.run(command, background=True)
+    log_path = log_path or _swerex_remote_log_path()
+    quoted_log_path = shlex.quote(log_path)
+    command_with_logs = f"rm -f {quoted_log_path}; ( {command} ) > {quoted_log_path} 2>&1"
+    handle = sandbox.commands.run(command_with_logs, background=True)
     url = sandbox.get_port_url(port, internal=internal).replace("http://", "https://")
     return handle, url
 
@@ -126,6 +171,68 @@ else
 fi
 """
     return sandbox.commands.run(command, timeout=60)
+
+
+def _collect_startup_diagnostics(sandbox: Any, *, port: int, auth_token: str, log_path: str) -> Any:
+    command = f"""
+set +e
+PORT={shlex.quote(str(port))}
+AUTH_TOKEN={shlex.quote(auth_token)}
+LOG_PATH={shlex.quote(log_path)}
+export PORT AUTH_TOKEN LOG_PATH
+
+echo "=== swerex startup diagnostics ==="
+echo "port=$PORT"
+echo "log_path=$LOG_PATH"
+
+echo "=== swerex/python processes ==="
+ps -ef | grep -E 'swerex|python' | grep -v grep || true
+PID="$(pgrep -f 'swerex-remote|swerex.server' | head -1 || true)"
+echo "swerex_pid=$PID"
+if [ -n "$PID" ]; then
+    echo "swerex_exe=$(readlink -f /proc/$PID/exe 2>/dev/null || true)"
+    printf 'swerex_cmdline='
+    tr '\\0' ' ' < /proc/$PID/cmdline 2>/dev/null || true
+    echo
+fi
+
+echo "=== listening sockets ==="
+(ss -ltnp 2>&1 || netstat -ltnp 2>&1 || true) | grep -E "(:$PORT|Local Address|LISTEN)" || true
+
+echo "=== sandbox-local /is_alive probe ==="
+PROBE_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+echo "probe_python=$PROBE_PY"
+if [ -n "$PROBE_PY" ]; then
+    "$PROBE_PY" - <<'PY' 2>&1 || true
+import os
+import urllib.error
+import urllib.request
+
+port = os.environ["PORT"]
+token = os.environ["AUTH_TOKEN"]
+url = f"http://127.0.0.1:{{port}}/is_alive"
+req = urllib.request.Request(url, headers={{"X-API-Key": token}})
+try:
+    with urllib.request.urlopen(req, timeout=5) as response:
+        print("status=", response.status)
+        print(response.read().decode(errors="replace"))
+except Exception as exc:
+    print(f"is_alive_error={{type(exc).__name__}}: {{exc}}")
+    if isinstance(exc, urllib.error.HTTPError):
+        print(exc.read().decode(errors="replace"))
+PY
+else
+    echo "No python/python3 available for local /is_alive probe"
+fi
+
+echo "=== swerex background log ==="
+if [ -f "$LOG_PATH" ]; then
+    tail -200 "$LOG_PATH"
+else
+    echo "missing $LOG_PATH"
+fi
+"""
+    return sandbox.commands.run(command, timeout=30)
 
 
 def _kill_sandbox(sandbox: Any) -> None:
@@ -195,14 +302,16 @@ class YRDeployment(AbstractDeployment):
             self.logger.warning("Deployment is already started. Ignoring duplicate start() call.")
             return
 
+        self._stopped = False
         loop = asyncio.get_running_loop()
         token = self._get_token()
         swerex_cmd = self._swerex_start_command(token)
+        swerex_remote_log_path = _swerex_remote_log_path()
 
         self.logger.info(
             f"Starting YR sandbox (port={self._port}, port_forwardings=[{self._port}], "
             f"image={self._config.image!r}, cpu={self._config.cpu}, memory={self._config.memory}), "
-            f"swerex_cmd: {swerex_cmd}"
+            f"swerex_cmd: {swerex_cmd}, remote_log_path={swerex_remote_log_path}"
         )
         self._hooks.on_custom_step("Creating YR sandbox (port forwarding)")
         t0 = time.time()
@@ -218,7 +327,7 @@ class YRDeployment(AbstractDeployment):
             )
             probe_result = await loop.run_in_executor(None, _probe_python_runtime, self._sandbox)
             self.logger.info(
-                "OpenYuanRong runtime probe finished (exit_code=%s)\nstdout:\n%s\nstderr:\n%s",
+                "OpenYuanRong runtime probe finished (exit_code={})\nstdout:\n{}\nstderr:\n{}",
                 getattr(probe_result, "exit_code", None),
                 getattr(probe_result, "stdout", ""),
                 getattr(probe_result, "stderr", ""),
@@ -232,6 +341,7 @@ class YRDeployment(AbstractDeployment):
                 command=swerex_cmd,
                 port=self._port,
                 internal=self._config.internal,
+                log_path=swerex_remote_log_path,
             ),
         )
 
@@ -251,8 +361,32 @@ class YRDeployment(AbstractDeployment):
 
         remaining_startup_timeout = max(0, self._config.startup_timeout - elapsed_sandbox_creation)
         t1 = time.time()
-        await self._wait_until_alive(timeout=remaining_startup_timeout)
-        await self.runtime.create_session(CreateBashSessionRequest(startup_timeout=60))
+        try:
+            await self._wait_until_alive(timeout=remaining_startup_timeout)
+            await self.runtime.create_session(CreateBashSessionRequest(startup_timeout=60))
+        except Exception:
+            diagnostics = await loop.run_in_executor(
+                None,
+                lambda: _collect_startup_diagnostics(
+                    self._sandbox,
+                    port=self._port,
+                    auth_token=token,
+                    log_path=swerex_remote_log_path,
+                ),
+            )
+            diagnostics_path = await loop.run_in_executor(
+                None,
+                lambda: _write_local_startup_diagnostics(self.run_id, diagnostics),
+            )
+            self.logger.error(
+                "OpenYuanRong runtime startup diagnostics written to {}\n"
+                "OpenYuanRong runtime startup diagnostics (exit_code={})\nstdout:\n{}\nstderr:\n{}",
+                diagnostics_path,
+                getattr(diagnostics, "exit_code", None),
+                getattr(diagnostics, "stdout", ""),
+                getattr(diagnostics, "stderr", ""),
+            )
+            raise
         self.logger.info(f"Runtime started in {time.time() - t1:.2f}s")
 
     async def start(self, max_retries: int = 5) -> None:

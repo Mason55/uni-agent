@@ -559,10 +559,13 @@ class _GatewayActor:
 
         if self._debug:
             _msgs = request_context["messages"]
+            _roles = [m["role"] for m in _msgs]
             getLogger("gateway").debug(
                 "session=%s request: %d messages, roles=%s",
-                session_id, len(_msgs), [m["role"] for m in _msgs],
+                session_id, len(_msgs), _roles,
             )
+            with open("/tmp/gateway_debug.log", "a") as _f:
+                _f.write(f"[request] session={session_id} msgs={len(_msgs)} roles={_roles}\n")
 
         async with session.generation_lock:
             if session.phase != SessionPhase.ACTIVE:
@@ -664,6 +667,11 @@ class _GatewayActor:
                     "session=%s response: finish_reason=%s tool_calls=%s prompt_tokens=%d completion_tokens=%d",
                     session_id, finish_reason, _tc_names, len(generation_context_ids), len(response_ids),
                 )
+                with open("/tmp/gateway_debug.log", "a") as _f:
+                    _content = assistant_msg.get("content", "")[:200] if assistant_msg.get("content") else ""
+                    _f.write(f"[response] session={session_id} finish={finish_reason} tools={_tc_names} "
+                             f"prompt={len(generation_context_ids)} completion={len(response_ids)} "
+                             f"content={_content[:100]}\n")
             async with session.request_lock:
                 if session.phase != SessionPhase.ACTIVE:
                     raise HTTPException(

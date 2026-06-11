@@ -1,7 +1,8 @@
 """OpenYuanRong (AKernel) remote sandbox command execution.
 
 Uses ``akernel_sdk.Sandbox`` with sidecar ``Mount`` to inject the
-mini-swe-agent tool image.
+mini-swe-agent tool image.  Supports upstream tunnel so the agent
+inside the sandbox can reach the gateway via ``http://127.0.0.1:<proxy_port>``.
 """
 
 from __future__ import annotations
@@ -10,16 +11,22 @@ import asyncio
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 from examples.swe_agent_blackbox.sandbox.docker_sandbox import CommandResult
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PROXY_PORT = 38197
 
 
 def _configure_akernel_env() -> None:
     """Map OPENYUANRONG_* env vars to AKERNEL_* before importing akernel_sdk."""
     server = os.getenv("OPENYUANRONG_SERVER_ADDRESS")
     token = os.getenv("OPENYUANRONG_TOKEN")
+    # Disable SSL verify for tunnel WebSocket connection (YR server uses
+    # a self-signed or incompatible cert for the tunnel endpoint).
+    os.environ.setdefault("TUNNEL_SSL_VERIFY", "0")
     if not server or not token:
         raise ValueError(
             "OPENYUANRONG_SERVER_ADDRESS and OPENYUANRONG_TOKEN "
@@ -29,11 +36,37 @@ def _configure_akernel_env() -> None:
     os.environ["AKERNEL_TOKEN"] = token
 
 
+def extract_upstream(gateway_url: str) -> str:
+    """Extract host:port from a gateway URL for upstream tunnel config.
+
+    Example: "http://8.92.9.155:40169/sessions/abc/v1" -> "8.92.9.155:40169"
+    """
+    parsed = urlparse(gateway_url)
+    return f"{parsed.hostname}:{parsed.port}"
+
+
+def rewrite_gateway_url(gateway_url: str, proxy_port: int = DEFAULT_PROXY_PORT) -> str:
+    """Rewrite gateway URL to use the sandbox-internal tunnel.
+
+    Replaces host:port with 127.0.0.1:<proxy_port>, keeps path intact.
+
+    Example:
+        "http://8.92.9.155:40169/sessions/abc/v1"
+        -> "http://127.0.0.1:8766/sessions/abc/v1"
+    """
+    parsed = urlparse(gateway_url)
+    return f"http://127.0.0.1:{proxy_port}{parsed.path}"
+
+
 class YRSandboxCommands:
     """Command execution via OpenYuanRong (AKernel) remote sandbox."""
 
     def __init__(self, sandbox: Any) -> None:
         self._sandbox = sandbox
+
+    @property
+    def sandbox_id(self) -> str:
+        return getattr(self._sandbox, "sandbox_id", "unknown")
 
     # -- Factory --------------------------------------------------------------
 
@@ -43,9 +76,13 @@ class YRSandboxCommands:
         *,
         image: str,
         sidecar_image: str,
+        upstream: str = "",
+        proxy_port: int = DEFAULT_PROXY_PORT,
         env: dict[str, str] | None = None,
-        cpu: int = 4000,
-        memory: int = 8192,
+        cpu: int = 1000,
+        memory: int = 2048,
+        cpu_limit: int = 4000,
+        mem_limit: int = 8192,
         idle_timeout: int = 600,
         **sandbox_kwargs: Any,
     ) -> "YRSandboxCommands":
@@ -53,6 +90,9 @@ class YRSandboxCommands:
 
         The sidecar image is mounted at ``/opt/mini-swe-agent`` inside the
         sandbox via ``akernel_sdk.Mount``.
+
+        If ``upstream`` is provided, a tunnel is set up so the sandbox can
+        reach the local gateway via ``http://127.0.0.1:<proxy_port>``.
         """
         _configure_akernel_env()
         from akernel_sdk import Mount, Sandbox
@@ -61,22 +101,31 @@ class YRSandboxCommands:
             "image": image,
             "cpu": cpu,
             "memory": memory,
+            "cpu_limit": cpu_limit,
+            "mem_limit": mem_limit,
             "idle_timeout": idle_timeout,
             "mounts": [
                 Mount(target="/opt/mini-swe-agent", image_url=sidecar_image),
             ],
         }
+        if upstream:
+            sb_kwargs["upstream"] = upstream
+            sb_kwargs["proxy_port"] = proxy_port
         if env:
             sb_kwargs["env"] = env
         sb_kwargs.update(sandbox_kwargs)
 
         logger.info(
-            "Creating YR sandbox (image=%s, cpu=%d, memory=%d, sidecar=%s)",
-            image, cpu, memory, sidecar_image,
+            "Creating YR sandbox (image=%s, cpu=%d, memory=%d, sidecar=%s, upstream=%s)",
+            image, cpu, memory, sidecar_image, upstream or "none",
         )
         sandbox = await asyncio.to_thread(lambda: Sandbox(**sb_kwargs))
         logger.info("YR sandbox created: %s", getattr(sandbox, "sandbox_id", "?"))
         return cls(sandbox=sandbox)
+
+    def get_tunnel_url(self) -> str:
+        """Get the tunnel URL for accessing the gateway from inside the sandbox."""
+        return self._sandbox.get_tunnel_url()
 
     # -- SandboxCommands implementation ----------------------------------------
 

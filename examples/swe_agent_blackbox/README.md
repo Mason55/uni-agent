@@ -113,6 +113,7 @@ python examples/swe_agent_blackbox/parallel_infer.py \
 ```bash
 export OPENYUANRONG_SERVER_ADDRESS="6.2.179.37:8888"
 export OPENYUANRONG_TOKEN="<your-token>"
+export DEPLOYMENT=openyuanrong
 ```
 
 ### 运行
@@ -121,6 +122,8 @@ export OPENYUANRONG_TOKEN="<your-token>"
 RUNNER=mini_swe \
 OPENYUANRONG_SERVER_ADDRESS="6.2.179.37:8888" \
 OPENYUANRONG_TOKEN="<token>" \
+DEPLOYMENT=openyuanrong \
+MINI_SWE_AGENT_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest \
 bash examples/swe_agent_blackbox/scripts/run_infer.sh
 ```
 
@@ -156,10 +159,11 @@ bash examples/swe_agent_blackbox/scripts/run_train_megatron_async.sh
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SWE_AGENT_SANDBOX_TYPE` | `"local"` | 沙箱类型：`"local"` 或 `"openyuanrong"` |
+| `SWE_AGENT_SANDBOX_TYPE` | `"openyuanrong"` | 沙箱类型：`"local"` 或 `"openyuanrong"` |
 | `SWE_AGENT_MAX_TURNS` | `250` | Agent 最大步数 |
 | `SWE_AGENT_EVAL_TIMEOUT` | `600` | Reward 评估超时（秒） |
-| `MINI_SWE_AGENT_IMAGE` | `mini-swe-agent-tool:latest` | sidecar 工具镜像 |
+| `MINI_SWE_AGENT_IMAGE` | `swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest` | sidecar 工具镜像 |
+| `N_GPUS_PER_NODE` | `8` | 每节点 GPU 数量 |
 | `DEBUG_MODE` | (unset) | 设为任意值开启 DEBUG 日志 |
 
 ### 数据集 tools_kwargs.env 字段
@@ -244,4 +248,18 @@ bash examples/swe_agent_blackbox/build_tool.sh
 ```bash
 echo $OPENYUANRONG_SERVER_ADDRESS
 echo $OPENYUANRONG_TOKEN
+```
+
+### YR tunnel 连接超时
+
+当 `OPENYUANRONG_SERVER_ADDRESS` 使用 443 端口（HTTPS）时，tunnel WebSocket 连接可能超时。
+需要修改 `akernel_sdk` 本地代码，将 `ws://` 改为 `wss://`：
+
+```bash
+# 编辑文件
+vi /usr/local/lib/python3.12/dist-packages/akernel_sdk/sandbox_api.py
+
+# 修改以下行：
+# 原: tunnel_ws_url = f"ws://{gateway}/{safe_id}/{tunnel_port}"
+# 改: tunnel_ws_url = f"wss://{gateway}/{safe_id}/{tunnel_port}"
 ```

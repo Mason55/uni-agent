@@ -19,6 +19,9 @@ ARG PBS_RELEASE="20260602"
 ARG PBS_PYTHON="3.12.13"
 ARG PIP_INDEX_URL=""
 
+# Use mirrors for faster downloads in China
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
 # Download and extract python-build-standalone (stripped, 32MB)
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
@@ -38,7 +41,8 @@ RUN /opt/mini-swe-agent/bin/pip install --no-cache-dir \
 # Copy the in-sandbox runner script
 COPY run_agent.py /opt/mini-swe-agent/bin/run_agent.py
 
-# Final scratch image: only the standalone Python + packages
+# Final scratch image: files are at the image root level so that when
+# akernel_sdk.Mount(target="/opt/mini-swe-agent") overlays this image,
+# the files appear at /opt/mini-swe-agent/bin/python3.12 etc.
 FROM scratch
-COPY --from=builder /opt/mini-swe-agent /opt/mini-swe-agent
-ENTRYPOINT ["/opt/mini-swe-agent/bin/python3.12"]
+COPY --from=builder /opt/mini-swe-agent /

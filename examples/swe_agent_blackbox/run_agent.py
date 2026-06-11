@@ -72,7 +72,7 @@ def main() -> None:
         agent_defaults.update(agent_overrides)
         agent_cfg = agent_defaults
         agent_cfg["cost_limit"] = 0
-        step_limit = int(os.environ.get("SWE_AGENT_MAX_TURNS", str(agent_cfg.get("step_limit", 250))))
+        step_limit = agent_cfg.get("step_limit", 250)
         agent_cfg["step_limit"] = step_limit
         agent = DefaultAgent(model, env, **agent_cfg)
 

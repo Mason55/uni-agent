@@ -35,7 +35,7 @@ if os.environ.get("DEBUG_MODE"):
 
 
 # Default sidecar image — user can change this or set MINI_SWE_AGENT_IMAGE env var.
-MINI_SWE_AGENT_IMAGE = os.environ.get("MINI_SWE_AGENT_IMAGE", "mini-swe-agent-tool:latest")
+MINI_SWE_AGENT_IMAGE = os.environ.get("MINI_SWE_AGENT_IMAGE", "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest")
 
 
 async def _create_sandbox(
@@ -43,6 +43,7 @@ async def _create_sandbox(
     image: str,
     sandbox_type: str,
     sidecar_image: str = MINI_SWE_AGENT_IMAGE,
+    gateway_url: str = "",
 ):
     """Create a sandbox with the mini-swe-agent sidecar tool mounted."""
     if sandbox_type == "local":
@@ -50,9 +51,12 @@ async def _create_sandbox(
 
         return await DockerSandboxCommands.create(image=image, sidecar_image=sidecar_image)
     elif sandbox_type == "openyuanrong":
-        from examples.swe_agent_blackbox.sandbox.yr_sandbox import YRSandboxCommands
+        from examples.swe_agent_blackbox.sandbox.yr_sandbox import YRSandboxCommands, extract_upstream
 
-        return await YRSandboxCommands.create(image=image, sidecar_image=sidecar_image)
+        upstream = extract_upstream(gateway_url) if gateway_url else ""
+        return await YRSandboxCommands.create(
+            image=image, sidecar_image=sidecar_image, upstream=upstream,
+        )
     else:
         raise ValueError(f"Unknown sandbox_type={sandbox_type!r}. Supported: 'local', 'openyuanrong'")
 
@@ -154,20 +158,35 @@ async def mini_swe_agent_runner(
         raise ValueError(f"No Docker image found in tools_kwargs.env for sample {sample_index}")
 
     # 3. Sandbox deployment config (hardcoded + global env var)
-    sandbox_type = os.environ.get("SWE_AGENT_SANDBOX_TYPE", "local")
+    sandbox_type = os.environ.get("SWE_AGENT_SANDBOX_TYPE", "openyuanrong")
+
+    # 4. Gateway URL — get early to pass upstream for YR tunnel
+    gateway_url = session.base_url
+    if not gateway_url:
+        raise ValueError(f"gateway_url is empty for sample {sample_index}")
+    with open(f"/tmp/gateway_url_{sample_index}.txt", "w") as f:
+        f.write(gateway_url)
 
     sandbox = await _create_sandbox(
         image=image,
         sandbox_type=sandbox_type,
         sidecar_image=MINI_SWE_AGENT_IMAGE,
+        gateway_url=gateway_url,
     )
-    logger.info("Sandbox created (type=%s, image=%s)", sandbox_type, image)
+    sandbox_id = sandbox.sandbox_id
+    logger.info("Sandbox created (type=%s, image=%s, sandbox_id=%s)", sandbox_type, image, sandbox_id)
 
-    # 4. Build task config — gateway URL comes directly from session
+    # 5. Build task config — for YR, rewrite gateway URL to use tunnel
     step_limit = int(os.environ.get("SWE_AGENT_MAX_TURNS", "250"))
+    if sandbox_type == "openyuanrong":
+        from examples.swe_agent_blackbox.sandbox.yr_sandbox import rewrite_gateway_url
+        agent_gateway_url = rewrite_gateway_url(gateway_url)
+        print(f"Tunnel gateway URL: {agent_gateway_url}", flush=True)
+    else:
+        agent_gateway_url = gateway_url
     task_config = _build_task_config(
         task=task,
-        gateway_url=session.base_url or "",
+        gateway_url=agent_gateway_url,
         agent_step_limit=step_limit,
     )
 
@@ -186,17 +205,22 @@ async def mini_swe_agent_runner(
         #    base64 encode the config JSON to avoid shell escaping issues
         config_b64 = base64.b64encode(json.dumps(task_config).encode()).decode()
         agent_cmd = (
+            "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
             f"echo {config_b64} | base64 -d | "
             "/opt/mini-swe-agent/bin/python /opt/mini-swe-agent/bin/run_agent.py"
         )
         logger.debug("[sample %d] starting agent inside sandbox", sample_index)
         t0 = time.perf_counter()
-        agent_result = await sandbox.run(agent_cmd, timeout=1800)
+        agent_result = await sandbox.run(agent_cmd, timeout=7200)
         elapsed = time.perf_counter() - t0
         logger.debug(
             "[sample %d] agent process finished: rc=%d (%.1fs)",
             sample_index, agent_result.exit_code, elapsed,
         )
+        with open(f"/tmp/agent_stdout_{sample_index}.txt", "w") as f:
+            f.write(agent_result.stdout)
+        with open(f"/tmp/agent_stderr_{sample_index}.txt", "w") as f:
+            f.write(agent_result.stderr)
 
         # 7. Parse result from stdout (last non-empty line is the result JSON)
         agent_info = _parse_agent_result(agent_result.stdout, sample_index)
@@ -221,7 +245,7 @@ async def mini_swe_agent_runner(
         await session_runtime.complete_session(session.session_id, reward_info=reward_info)
 
     except Exception as e:
-        logger.warning("Mini-swe-agent runner failed for sample %d: %s", sample_index, e)
+        logger.warning("Mini-swe-agent runner failed for sample %d (sandbox_id=%s): %s", sample_index, sandbox_id, e)
         raise
     finally:
         try:
@@ -231,12 +255,25 @@ async def mini_swe_agent_runner(
 
 
 def _parse_agent_result(stdout: str, sample_index: int) -> dict:
-    """Parse agent result JSON from run_agent.py stdout."""
+    """Parse agent result JSON from run_agent.py stdout.
+
+    litellm may print error messages to stdout, polluting the output.
+    The last line starting with '{' is the result JSON.
+    """
     stdout = stdout.strip()
     if not stdout:
         return {"exit_status": "error", "submission": ""}
+    # Try the last line that looks like JSON first
+    lines = [l.strip() for l in stdout.split("\n") if l.strip()]
+    for line in reversed(lines):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    # Fallback: try entire stdout
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        logger.warning("[sample %d] Failed to parse agent result: %s", sample_index, stdout[:200])
+        logger.warning("[sample %d] Failed to parse agent result (full stdout): %s", sample_index, stdout[:1000])
         return {"exit_status": "error", "submission": ""}

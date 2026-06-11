@@ -33,6 +33,10 @@ class DockerSandboxCommands:
     def __init__(self, container_id: str) -> None:
         self._container_id = container_id
 
+    @property
+    def sandbox_id(self) -> str:
+        return self._container_id[:12]
+
     @classmethod
     async def create(
         cls,

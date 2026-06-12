@@ -20,7 +20,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
 
 from .multi_modal_postprocess import compute_multi_modal_inputs, compute_position_ids
-from .types import SessionRuntime, Trajectory
+from .types import SessionHandle, SessionRuntime, Trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -433,7 +433,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         """Run one gateway session lifecycle and return finalized trajectories."""
         session_id = session_id or f"session-{sample_index}-0-{uuid4().hex}"
         sample_fields = self._extract_sample_fields(prompts=prompts, sample_index=sample_index)
-        session = await self.session_runtime.create_session(session_id)
+        session = self._prepare_session_handle(await self.session_runtime.create_session(session_id))
         try:
             await self.agent_runner(
                 raw_prompt=raw_prompt,
@@ -465,6 +465,15 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 )
             )
         return scored_trajectories, sample_fields
+
+    def _prepare_session_handle(self, session: SessionHandle) -> SessionHandle:
+        """Adapt the gateway session handle for the agent's client protocol.
+
+        The gateway hands out base_url ending in ``/v1`` (the OpenAI SDK
+        convention).  Subclasses targeting other API protocols can override
+        this to reshape the handle before it reaches the agent runner.
+        """
+        return session
 
     async def _score_trajectories(
         self,
@@ -615,3 +624,26 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         }
         return field, tag
 
+
+class AnthropicCompatibleAgentFramework(OpenAICompatibleAgentFramework):
+    """AgentFramework implementation for Anthropic-API agent loops.
+
+    Orchestration (session lifecycle, scoring, TransferQueue output) is
+    identical to ``OpenAICompatibleAgentFramework``; the agent instead talks
+    to the Gateway via the Anthropic Messages API
+    (``/sessions/{session_id}/v1/messages``), which the gateway converts to
+    its internal OpenAI message format for chat templating and token-level
+    trajectory collection.
+
+    The session handle's ``base_url`` is reshaped for the Anthropic SDK: the
+    OpenAI convention embeds the ``/v1`` suffix in base_url, while
+    ``anthropic.Anthropic(base_url=...)`` appends ``/v1/messages`` itself.
+    Agent runners can therefore pass ``session.base_url`` directly to
+    ``anthropic.Anthropic`` / ``AsyncAnthropic`` (any ``api_key`` works; the
+    gateway does not authenticate).
+    """
+
+    def _prepare_session_handle(self, session: SessionHandle) -> SessionHandle:
+        if session.base_url and session.base_url.endswith("/v1"):
+            return replace(session, base_url=session.base_url[: -len("/v1")])
+        return session

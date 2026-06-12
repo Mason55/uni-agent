@@ -14,15 +14,21 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from uni_agent.trainer.framework.types import SessionHandle, Trajectory
-from uni_agent.trainer.gateway.types import GatewaySessionState, SessionPhase, TrajectoryBuffer
+from uni_agent.trainer.gateway.anthropic_compat import (
+    anthropic_error_body,
+    anthropic_payload_to_openai,
+    openai_completion_to_anthropic_message,
+)
+from uni_agent.trainer.gateway.types import (
+    GatewaySessionState,
+    MalformedRequestError,
+    SessionPhase,
+    TrajectoryBuffer,
+)
 from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.utils.chat_template import apply_chat_template as _apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.utils import run_uvicorn
-
-
-class MalformedRequestError(ValueError):
-    pass
 
 
 _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS = frozenset({
@@ -320,6 +326,11 @@ class _GatewayActor:
             payload = await request.json()
             return await self._handle_chat_completions(session_id=session_id, payload=payload)
 
+        @self._app.post("/sessions/{session_id}/v1/messages")
+        async def _anthropic_messages(session_id: str, request: Request):
+            payload = await request.json()
+            return await self._handle_anthropic_messages(session_id=session_id, payload=payload)
+
         @self._app.post("/sessions/{session_id}/complete")
         async def _complete(session_id: str, request: Request):
             payload = await request.json()
@@ -548,6 +559,37 @@ class _GatewayActor:
         return {"role": "assistant", "content": response_text}, finish_reason
 
     async def _handle_chat_completions(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
+        completion = await self._chat_completions_turn(session_id=session_id, payload=payload)
+        return JSONResponse(completion)
+
+    async def _handle_anthropic_messages(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Serve the Anthropic ``/v1/messages`` API on top of the shared chat turn.
+
+        Requests are converted to the internal OpenAI format (so prefix
+        comparison and trajectory tracking are shared with the
+        ``/v1/chat/completions`` path), and results/errors are shaped into the
+        Anthropic Message / error envelopes that the ``anthropic`` SDK expects.
+        """
+        try:
+            openai_payload = anthropic_payload_to_openai(payload)
+        except MalformedRequestError as exc:
+            return JSONResponse(status_code=400, content=anthropic_error_body(400, str(exc)))
+        try:
+            completion = await self._chat_completions_turn(session_id=session_id, payload=openai_payload)
+        except HTTPException as exc:
+            message = exc.detail
+            if isinstance(message, dict):
+                error = message.get("error")
+                message = error.get("message") if isinstance(error, dict) else json.dumps(message)
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=anthropic_error_body(exc.status_code, str(message)),
+            )
+        return JSONResponse(
+            openai_completion_to_anthropic_message(completion, request_model=payload.get("model"))
+        )
+
+    async def _chat_completions_turn(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"Unknown session_id: {session_id}")
@@ -679,24 +721,22 @@ class _GatewayActor:
                 session.request_tools = tools
                 self._touch_session(session)
 
-                return JSONResponse(
-                    {
-                        "id": f"chatcmpl-{uuid4().hex}",
-                        "object": "chat.completion",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": assistant_msg,
-                                "finish_reason": finish_reason,
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": len(generation_context_ids),
-                            "completion_tokens": len(response_ids),
-                            "total_tokens": len(generation_context_ids) + len(response_ids),
-                        },
-                    }
-                )
+                return {
+                    "id": f"chatcmpl-{uuid4().hex}",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": assistant_msg,
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(generation_context_ids),
+                        "completion_tokens": len(response_ids),
+                        "total_tokens": len(generation_context_ids) + len(response_ids),
+                    },
+                }
 
     async def start(self) -> None:
         if self._server_task is not None:

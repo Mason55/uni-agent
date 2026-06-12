@@ -19,6 +19,7 @@ TOP_P="${TOP_P:-1.0}"
 N="${N:-8}"
 ENGINE="${ENGINE:-vllm}"
 TP="${TP:-4}"
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 
 # ── Agent parameters ─────────────────────────────────────────────────────
 RUNNER="${RUNNER:-uniagent}"
@@ -50,4 +51,5 @@ python examples/swe_agent_blackbox/parallel_infer.py \
     --tensor-parallel-size "${TP}" \
     --max-turns "${SWE_AGENT_MAX_TURNS}" \
     --runner "${RUNNER}" \
-    --agent-config-path "${AGENT_CONFIG_PATH}"
+    --agent-config-path "${AGENT_CONFIG_PATH}" \
+    --n-gpus-per-node "${N_GPUS_PER_NODE}"

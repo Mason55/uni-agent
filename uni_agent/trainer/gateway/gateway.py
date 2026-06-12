@@ -559,9 +559,10 @@ class _GatewayActor:
 
         if self._debug:
             _msgs = request_context["messages"]
+            _roles = [m["role"] for m in _msgs]
             getLogger("gateway").debug(
                 "session=%s request: %d messages, roles=%s",
-                session_id, len(_msgs), [m["role"] for m in _msgs],
+                session_id, len(_msgs), _roles,
             )
 
         async with session.generation_lock:

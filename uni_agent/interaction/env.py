@@ -1,3 +1,4 @@
+import os
 import re
 import shlex
 from pathlib import Path, PurePath
@@ -31,6 +32,18 @@ class ActionIncorrectSyntaxError(Exception):
 
 class TerminalNotAliveError(Exception):
     pass
+
+
+SANDBOX_PIP_INDEX_URL_ENV = "UNI_AGENT_SANDBOX_PIP_INDEX_URL"
+
+
+def _with_sandbox_pip_index_url(env_variables: dict[str, str] | None) -> dict[str, str] | None:
+    pip_index_url = os.getenv(SANDBOX_PIP_INDEX_URL_ENV)
+    if not pip_index_url:
+        return env_variables
+    merged = dict(env_variables or {})
+    merged["PIP_INDEX_URL"] = pip_index_url
+    return merged
 
 
 class AgentEnvConfig(BaseModel):
@@ -73,8 +86,9 @@ class AgentEnv:
 
         await self.deployment.start(max_retries=max_retries)
         self.logger.info("Runtime initialized")
-        if self.env_variables:
-            await self.set_env_variables(self.env_variables)
+        env_variables = _with_sandbox_pip_index_url(self.env_variables)
+        if env_variables:
+            await self.set_env_variables(env_variables)
         if self.post_setup_cmd:
             await self.communicate(self.post_setup_cmd, check="raise")
 

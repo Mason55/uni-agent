@@ -6,8 +6,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # ── Model & data ─────────────────────────────────────────────────────────
 MODEL_PATH="${MODEL_PATH:-$HOME/models/Qwen3.5-9B}"
 DATA_PATH="${DATA_PATH:-$HOME/data/swe_agent/swe_bench_verified.parquet}"
@@ -31,7 +29,6 @@ export SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
 
 # ── Logging ──────────────────────────────────────────────────────────────
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
-export OPENYUANRONG_SWEREX_LOCAL_LOG_DIR="${OPENYUANRONG_SWEREX_LOCAL_LOG_DIR:-${SCRIPT_DIR}}"
 
 echo "=== SWE-Agent Blackbox Inference ==="
 echo "Model: ${MODEL_PATH}"

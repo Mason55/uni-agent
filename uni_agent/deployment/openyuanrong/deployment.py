@@ -14,7 +14,7 @@ from swerex.runtime.abstract import CreateBashSessionRequest, IsAliveResponse
 from swerex.utils.wait import _wait_until_alive
 
 from uni_agent.async_logging import get_logger
-from uni_agent.deployment.config import YRDeploymentConfig
+from uni_agent.deployment.config import YRDeploymentConfig, YRMountConfig
 from uni_agent.deployment.remote_runtime import RemoteRuntime, RemoteRuntimeConfig
 
 __all__ = ["YRDeployment"]
@@ -64,6 +64,33 @@ def _create_sandbox(config: YRDeploymentConfig) -> Any:
     kwargs["port_forwardings"] = [config.port]
 
     return Sandbox(**kwargs)
+
+
+def _mounted_swerex_command(runtime_target: str) -> str:
+    runtime_target = runtime_target.rstrip("/")
+    return (
+        f"{runtime_target}/bin/python {runtime_target}/bin/swerex-remote"
+        " --host 0.0.0.0 --port {port} --auth-token {token}"
+    )
+
+
+def _apply_runtime_mount_env_overrides(config: YRDeploymentConfig) -> YRDeploymentConfig:
+    runtime_image = os.getenv("OPENYUANRONG_SWEREX_RUNTIME_IMAGE")
+    runtime_target = os.getenv("OPENYUANRONG_SWEREX_RUNTIME_TARGET", "/opt/swe-rex").rstrip("/")
+    if runtime_image:
+        mounts = list(config.mounts)
+        for mount in mounts:
+            if mount.target == runtime_target:
+                mount.image_url = runtime_image
+                break
+        else:
+            mounts.append(YRMountConfig(target=runtime_target, image_url=runtime_image))
+        config.mounts = mounts
+
+    if not config.command and (runtime_image or config.mounts):
+        config.command = _mounted_swerex_command(runtime_target)
+
+    return config
 
 
 def _swerex_remote_log_path() -> str:
@@ -119,17 +146,17 @@ def _start_swerex_via_port_forwarding(
     return handle, url
 
 
-def _runtime_probe_enabled() -> bool:
-    value = os.getenv("OPENYUANRONG_RUNTIME_PROBE", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+def _runtime_debug_enabled() -> bool:
+    value = os.getenv("OPENYUANRONG_RUNTIME_DEBUG", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
-def _probe_python_runtime(sandbox: Any) -> Any:
+def _debug_python_runtime(sandbox: Any) -> Any:
     command = r"""
 set +e
-echo "=== task image python / swe-rex probe ==="
+echo "=== task image python / swe-rex debug ==="
 
-probe_python() {
+debug_python() {
     label="$1"
     py="$2"
     if command -v "$py" >/dev/null 2>&1; then
@@ -157,12 +184,12 @@ else:
 PY
 }
 
-probe_python "task-python" "python"
-probe_python "task-python3" "python3"
-probe_python "task-/usr/bin/python3" "/usr/bin/python3"
+debug_python "task-python" "python"
+debug_python "task-python3" "python3"
+debug_python "task-/usr/bin/python3" "/usr/bin/python3"
 
-echo "=== mounted sidecar /opt/swe-rex python / swe-rex probe ==="
-probe_python "sidecar-/opt/swe-rex/bin/python" "/opt/swe-rex/bin/python"
+echo "=== mounted sidecar /opt/swe-rex python / swe-rex debug ==="
+debug_python "sidecar-/opt/swe-rex/bin/python" "/opt/swe-rex/bin/python"
 
 if [ -e /opt/swe-rex/bin/swerex-remote ]; then
     echo "[sidecar-swerex-remote] exists: /opt/swe-rex/bin/swerex-remote"
@@ -199,11 +226,11 @@ fi
 echo "=== listening sockets ==="
 (ss -ltnp 2>&1 || netstat -ltnp 2>&1 || true) | grep -E "(:$PORT|Local Address|LISTEN)" || true
 
-echo "=== sandbox-local /is_alive probe ==="
-PROBE_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-echo "probe_python=$PROBE_PY"
-if [ -n "$PROBE_PY" ]; then
-    "$PROBE_PY" - <<'PY' 2>&1 || true
+echo "=== sandbox-local /is_alive check ==="
+DEBUG_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+echo "debug_python=$DEBUG_PY"
+if [ -n "$DEBUG_PY" ]; then
+    "$DEBUG_PY" - <<'PY' 2>&1 || true
 import os
 import urllib.error
 import urllib.request
@@ -244,7 +271,7 @@ class YRDeployment(AbstractDeployment):
 
     def __init__(self, run_id: str, **kwargs: Any):
         self.run_id = run_id
-        self._config = YRDeploymentConfig(**kwargs)
+        self._config = _apply_runtime_mount_env_overrides(YRDeploymentConfig(**kwargs))
         self._runtime: RemoteRuntime | None = None
         self._sandbox: Any | None = None
         self._command_handle: Any | None = None
@@ -320,17 +347,17 @@ class YRDeployment(AbstractDeployment):
         elapsed_sandbox_creation = time.time() - t0
         self.logger.info(f"Sandbox {self._sandbox.sandbox_id} created in {elapsed_sandbox_creation:.2f}s")
 
-        if _runtime_probe_enabled():
+        if _runtime_debug_enabled():
             self.logger.info(
-                "Probing task image and mounted sidecar runtime before starting swe-rex "
+                "Debugging task image and mounted sidecar runtime before starting swe-rex "
                 f"(image={self._config.image!r}, mounts={self._config.mounts!r})"
             )
-            probe_result = await loop.run_in_executor(None, _probe_python_runtime, self._sandbox)
+            debug_result = await loop.run_in_executor(None, _debug_python_runtime, self._sandbox)
             self.logger.info(
-                "OpenYuanRong runtime probe finished (exit_code={})\nstdout:\n{}\nstderr:\n{}",
-                getattr(probe_result, "exit_code", None),
-                getattr(probe_result, "stdout", ""),
-                getattr(probe_result, "stderr", ""),
+                "OpenYuanRong runtime debug finished (exit_code={})\nstdout:\n{}\nstderr:\n{}",
+                getattr(debug_result, "exit_code", None),
+                getattr(debug_result, "stdout", ""),
+                getattr(debug_result, "stderr", ""),
             )
 
         self._hooks.on_custom_step(f"Starting swerex on port {self._port} (background)")

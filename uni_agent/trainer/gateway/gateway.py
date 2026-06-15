@@ -11,18 +11,26 @@ from uuid import uuid4
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from uni_agent.trainer.framework.types import SessionHandle, Trajectory
-from uni_agent.trainer.gateway.types import GatewaySessionState, SessionPhase, TrajectoryBuffer
+from uni_agent.trainer.gateway.anthropic_compat import (
+    anthropic_error_body,
+    anthropic_payload_to_openai,
+    anthropic_stream_events,
+    encode_anthropic_sse_event,
+    openai_completion_to_anthropic_message,
+)
+from uni_agent.trainer.gateway.types import (
+    GatewaySessionState,
+    MalformedRequestError,
+    SessionPhase,
+    TrajectoryBuffer,
+)
 from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.utils.chat_template import apply_chat_template as _apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.utils import run_uvicorn
-
-
-class MalformedRequestError(ValueError):
-    pass
 
 
 _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS = frozenset({
@@ -294,6 +302,8 @@ class _GatewayActor:
         self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
         self._apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self._base_sampling_params = dict(base_sampling_params or {})
+        self._agent_log_path = os.environ.get("GATEWAY_AGENT_LOG_PATH")
+        self._agent_log_max_chars = int(os.environ.get("GATEWAY_AGENT_LOG_MAX_CHARS", "0") or "0")
         allowed_keys = (
             _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
             if allowed_request_sampling_param_keys is None
@@ -314,11 +324,57 @@ class _GatewayActor:
         self._server_base_url: str | None = None
         self._register_routes()
 
+    def _write_agent_log(self, *, event: str, session_id: str, payload: dict[str, Any]) -> None:
+        if not self._agent_log_path:
+            return
+
+        record = {
+            "ts": time.time(),
+            "event": event,
+            "session_id": session_id,
+            **payload,
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        if self._agent_log_max_chars > 0 and len(line) > self._agent_log_max_chars:
+            record = {
+                "ts": record["ts"],
+                "event": event,
+                "session_id": session_id,
+                "truncated": True,
+                "max_chars": self._agent_log_max_chars,
+                "preview": line[: self._agent_log_max_chars],
+            }
+            line = json.dumps(record, ensure_ascii=False, default=str)
+
+        try:
+            log_dir = os.path.dirname(self._agent_log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(self._agent_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as exc:
+            getLogger("gateway").warning("failed to write gateway agent log: %s", exc)
+
     def _register_routes(self) -> None:
         @self._app.post("/sessions/{session_id}/v1/chat/completions")
         async def _chat_completions(session_id: str, request: Request):
             payload = await request.json()
+            self._write_agent_log(
+                event="openai.request.raw",
+                session_id=session_id,
+                payload={"payload": payload},
+            )
             return await self._handle_chat_completions(session_id=session_id, payload=payload)
+
+        @self._app.post("/sessions/{session_id}/v1/messages")
+        async def _anthropic_messages(session_id: str, request: Request):
+            payload = await request.json()
+            self._write_agent_log(
+                event="anthropic.request.raw",
+                session_id=session_id,
+                payload={"payload": payload},
+            )
+            return await self._handle_anthropic_messages(session_id=session_id, payload=payload)
 
         @self._app.post("/sessions/{session_id}/complete")
         async def _complete(session_id: str, request: Request):
@@ -515,15 +571,15 @@ class _GatewayActor:
                 OpenAI-spec-normalized stop_reason (see _FINISH_REASON_MAP).
         """
         if self._tool_parser is not None and tools:
-            parsed_tools = None
+            parsed_tools = []
             try:
                 from verl.tools.schemas import OpenAIFunctionToolSchema
                 parsed_tools = [
                     OpenAIFunctionToolSchema(**t) if isinstance(t, dict) else t
                     for t in tools
                 ]
-            except Exception:
-                pass
+            except Exception as exc:
+                getLogger("gateway").warning("failed to parse tool schemas; continuing without schemas: %s", exc)
             content, function_calls = await self._tool_parser.extract_tool_calls(response_ids, parsed_tools)
             if function_calls:
                 tool_calls = [
@@ -548,6 +604,45 @@ class _GatewayActor:
         return {"role": "assistant", "content": response_text}, finish_reason
 
     async def _handle_chat_completions(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
+        completion = await self._chat_completions_turn(session_id=session_id, payload=payload)
+        return JSONResponse(completion)
+
+    async def _handle_anthropic_messages(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
+        try:
+            openai_payload = anthropic_payload_to_openai(payload)
+        except MalformedRequestError as exc:
+            return JSONResponse(status_code=400, content=anthropic_error_body(400, str(exc)))
+        self._write_agent_log(
+            event="anthropic.request.converted_openai",
+            session_id=session_id,
+            payload={"payload": openai_payload},
+        )
+        try:
+            completion = await self._chat_completions_turn(session_id=session_id, payload=openai_payload)
+        except HTTPException as exc:
+            message = exc.detail
+            if isinstance(message, dict):
+                error = message.get("error")
+                message = error.get("message") if isinstance(error, dict) else json.dumps(message)
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=anthropic_error_body(exc.status_code, str(message)),
+            )
+        message = openai_completion_to_anthropic_message(completion, request_model=payload.get("model"))
+        self._write_agent_log(
+            event="anthropic.response",
+            session_id=session_id,
+            payload={"payload": message, "stream": bool(payload.get("stream"))},
+        )
+        if payload.get("stream"):
+            async def _event_stream():
+                for event in anthropic_stream_events(message):
+                    yield encode_anthropic_sse_event(event)
+
+            return StreamingResponse(_event_stream(), media_type="text/event-stream")
+        return JSONResponse(message)
+
+    async def _chat_completions_turn(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"Unknown session_id: {session_id}")
@@ -556,6 +651,14 @@ class _GatewayActor:
             request_context = _normalize_request_context(payload)
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        self._write_agent_log(
+            event="openai.request.normalized",
+            session_id=session_id,
+            payload={
+                "messages": request_context["messages"],
+                "tools": request_context["tools"],
+            },
+        )
 
         if self._debug:
             _msgs = request_context["messages"]
@@ -687,24 +790,28 @@ class _GatewayActor:
                 session.request_tools = tools
                 self._touch_session(session)
 
-                return JSONResponse(
-                    {
-                        "id": f"chatcmpl-{uuid4().hex}",
-                        "object": "chat.completion",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": assistant_msg,
-                                "finish_reason": finish_reason,
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": len(generation_context_ids),
-                            "completion_tokens": len(response_ids),
-                            "total_tokens": len(generation_context_ids) + len(response_ids),
-                        },
-                    }
+                completion = {
+                    "id": f"chatcmpl-{uuid4().hex}",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": assistant_msg,
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(generation_context_ids),
+                        "completion_tokens": len(response_ids),
+                        "total_tokens": len(generation_context_ids) + len(response_ids),
+                    },
+                }
+                self._write_agent_log(
+                    event="openai.response",
+                    session_id=session_id,
+                    payload={"payload": completion},
                 )
+                return completion
 
     async def start(self) -> None:
         if self._server_task is not None:

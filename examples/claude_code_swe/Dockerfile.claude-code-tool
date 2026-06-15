@@ -1,0 +1,30 @@
+# Claude Code sidecar tool image.
+#
+# This image is meant to be mounted into a task sandbox at /opt/claude-code.
+# After mounting, run:
+#
+#   /opt/claude-code/bin/claude -p "fix the issue" --max-turns 3
+#
+# Claude Code's npm package installs the same native binary as the standalone
+# installer. Node is only needed during the build stage.
+
+FROM node:20-bookworm-slim AS builder
+
+ARG CLAUDE_CODE_VERSION="latest"
+ARG NPM_REGISTRY=""
+
+ENV DISABLE_AUTOUPDATER=1 \
+    IS_SANDBOX=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    npm_config_audit=false \
+    npm_config_fund=false \
+    npm_config_update_notifier=false
+
+RUN if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi \
+    && npm install -g --prefix /opt/claude-code "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && /opt/claude-code/bin/claude --version
+
+# Final scratch image: files live at image root so akernel_sdk.Mount with
+# target="/opt/claude-code" exposes /opt/claude-code/bin/claude in the sandbox.
+FROM scratch
+COPY --from=builder /opt/claude-code /

@@ -9,6 +9,10 @@ from typing import Any
 from uni_agent.trainer.framework.types import SessionHandle, Trajectory
 
 
+class MalformedRequestError(ValueError):
+    pass
+
+
 class SessionPhase(str, Enum):
     ACTIVE = "ACTIVE"
     COMPLETED = "COMPLETED"

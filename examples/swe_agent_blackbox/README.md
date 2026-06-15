@@ -2,11 +2,19 @@
 
 ## 概述
 
-mini-swe-agent 以 sidecar 工具镜像的形式挂载到沙箱内部运行。Agent 在沙箱内通过
+mini-swe-agent 和 Claude Code 均以 sidecar 工具镜像的形式挂载到沙箱内部运行。Agent 在沙箱内通过
 `LocalEnvironment`（本地 bash）执行命令，LLM 调用走 stdin 传入的 gateway URL。
 外部 runner 创建沙箱、触发 agent 执行、评估 reward。
 
-工具镜像使用 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 构建独立 Python 环境，不依赖沙箱容器内的 Python 版本，通过 `FROM scratch` 保持镜像最小化。
+mini_swe 工具镜像使用 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 构建独立 Python 环境；Claude Code 工具镜像使用 Node builder 安装 npm 包。两者都通过 `FROM scratch` 保持最终 sidecar 镜像最小化，不依赖沙箱基础镜像预装对应运行时。
+
+**支持的 runner：**
+
+| runner | 说明 |
+|--------|------|
+| `uniagent` | 原 SWE-agent runner |
+| `mini_swe` | mini-swe-agent sidecar runner |
+| `claude_code` | Claude Code sidecar runner，reward 通过 `complete_session(reward_info)` 返回，不额外落盘 reward JSON |
 
 **支持的沙箱类型：**
 
@@ -15,7 +23,7 @@ mini-swe-agent 以 sidecar 工具镜像的形式挂载到沙箱内部运行。Ag
 | 本地 Docker (`"local"`) | `docker exec` + `docker cp` 从工具镜像加载 sidecar |
 | OpenYuanRong (`"openyuanrong"`) | `akernel_sdk.Mount` + `sandbox.commands.run()` |
 
-两种沙箱类型都直接依赖 `mini-swe-agent-tool` 工具镜像，无需预先提取到 host 目录。
+两种沙箱类型都直接依赖所选 runner 的工具镜像，无需预先提取到 host 目录。
 
 ## 架构
 
@@ -41,11 +49,20 @@ mini-swe-agent 以 sidecar 工具镜像的形式挂载到沙箱内部运行。Ag
 ## 前置条件
 
 1. **Docker** — 本地模式需要
-2. **mini-swe-agent tool image** — 需预先构建（见下文）
+2. **runner tool image** — 需预先构建（见下文）
 
 ## 1. 构建 Tool Image
 
-使用 `build_tool.sh` 一次性构建：
+`mini_swe` 和 `claude_code` 都通过 sidecar tool image 注入到 SWE-bench 沙箱，但两者的镜像内容、挂载目录和加速源参数不同。统一使用 `build_tool.sh` 构建，通过 `--tool` 或 `TOOL_KIND` 选择目标 runner。
+
+| runner | 默认 tool image | Dockerfile | 沙箱内目录 | 镜像内容 | 加速源 |
+|--------|-----------------|------------|------------|----------|--------|
+| `mini_swe` | `mini-swe-agent-tool:latest` | `Dockerfile.mini-swe-agent-tool` | `/opt/mini-swe-agent` | 独立 Python 3.12 + `mini-swe-agent` + `litellm` + `run_agent.py` | `--pip-index` / `PIP_INDEX_URL` |
+| `claude_code` | `claude-code-tool:latest` | `Dockerfile.claude-code-tool` | `/opt/claude-code` | Node 20 构建出的 Claude Code npm 全局安装目录 | `--npm-registry` / `NPM_REGISTRY` |
+
+### mini_swe tool image
+
+默认构建的是 `mini_swe`：
 
 ```bash
 # 默认 PyPI 源
@@ -56,28 +73,81 @@ bash examples/swe_agent_blackbox/build_tool.sh --pip-index https://pypi.tuna.tsi
 
 # 推送到远程仓库
 bash examples/swe_agent_blackbox/build_tool.sh --registry swr.cn-east-3.myhuaweicloud.com/openyuanrong
+```
 
-# 组合使用
+mini_swe 镜像使用 `python-build-standalone` 构建独立 Python 环境，最终 `FROM scratch` 镜像只包含 `/opt/mini-swe-agent` 运行所需文件。它不依赖沙箱基础镜像里的 Python 版本。
+
+推送到远程仓库后，运行时通过 `SWE_AGENT_TOOL_IMAGE` 指向该镜像：
+
+```bash
+SWE_AGENT_TOOL_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest \
+RUNNER=mini_swe \
+bash examples/swe_agent_blackbox/scripts/run_infer.sh
+```
+
+### Claude Code tool image
+
+Claude Code 需要显式选择 `--tool claude_code`：
+
+```bash
+# 默认 npm registry
+bash examples/swe_agent_blackbox/build_tool.sh --tool claude_code
+
+# 使用国内 npm registry 加速
 bash examples/swe_agent_blackbox/build_tool.sh \
+    --tool claude_code \
+    --npm-registry https://registry.npmmirror.com
+
+# 指定 Claude Code npm 包版本
+bash examples/swe_agent_blackbox/build_tool.sh \
+    --tool claude_code \
+    --tool-version latest
+
+# 构建并推送 Claude Code sidecar
+bash examples/swe_agent_blackbox/build_tool.sh \
+    --tool claude_code \
+    --registry swr.cn-east-3.myhuaweicloud.com/openyuanrong
+```
+
+Claude Code 镜像使用 `node:20-bookworm-slim` 作为 builder，安装 `@anthropic-ai/claude-code` 到 `/opt/claude-code`，最终同样输出 `FROM scratch` 镜像。运行时 runner 会把该镜像加载到沙箱的 `/opt/claude-code`，并调用 `/opt/claude-code/bin/claude`。
+
+推送到远程仓库后，运行时同样通过 `SWE_AGENT_TOOL_IMAGE` 指向该镜像：
+
+```bash
+SWE_AGENT_TOOL_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest \
+RUNNER=claude_code \
+bash examples/swe_agent_blackbox/scripts/run_infer.sh
+```
+
+### 组合参数
+
+`--tool`、镜像 tag、加速源和 registry 可以组合使用：
+
+```bash
+bash examples/swe_agent_blackbox/build_tool.sh \
+    --tool mini_swe \
     --pip-index https://pypi.tuna.tsinghua.edu.cn/simple/ \
     --registry swr.cn-east-3.myhuaweicloud.com/openyuanrong
 ```
 
 脚本会：
-1. `docker build` 构建工具镜像 `mini-swe-agent-tool:latest`
-   - 基于 `python-build-standalone`（独立 Python 3.12，兼容不同 glibc 版本）
-   - `FROM scratch` 最终镜像，仅包含 Python + mini-swe-agent + litellm
+1. 按 `--tool` 选择 Dockerfile 和默认镜像名：
+   - `mini_swe` → `mini-swe-agent-tool:latest`
+   - `claude_code` → `claude-code-tool:latest`
 2. 如果指定 `--registry`，自动 tag + push 到远程仓库
 
-工具镜像内的 Python 与沙箱容器的 Python 完全隔离，互不影响。
+两个 tool image 都是 sidecar 运行时依赖，不是 SWE-bench 任务基础镜像。`mini_swe` 的 Python 与沙箱容器的 Python 完全隔离；`claude_code` 的 Node/npm 依赖也只存在于 `/opt/claude-code` sidecar 中，不要求沙箱基础镜像预装 Node。
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `TOOL_IMAGE` | `mini-swe-agent-tool` | 镜像名 |
+| `TOOL_IMAGE` | `mini-swe-agent-tool` / `claude-code-tool` | 镜像名，默认值随 `TOOL_KIND` 变化 |
 | `TOOL_TAG` | `latest` | 镜像 tag |
+| `TOOL_VERSION` | `latest` | 工具包版本；`claude_code` 构建时用于 `@anthropic-ai/claude-code` npm 包版本 |
 | `PIP_INDEX_URL` | (空，使用 PyPI) | pip 镜像源（也可通过 `--pip-index` 传入） |
+| `TOOL_KIND` | `mini_swe` | 工具类型：`mini_swe` 或 `claude_code` |
+| `NPM_REGISTRY` | (空，使用 npm 默认源) | npm 镜像源（也可通过 `--npm-registry` 传入） |
 
 ## 2. 推理（本地 Docker 沙箱）
 
@@ -87,6 +157,7 @@ bash examples/swe_agent_blackbox/build_tool.sh \
 cd /home/dyp/recipe/uni-agent
 
 RUNNER=mini_swe \
+SWE_AGENT_TOOL_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest \
 MODEL_PATH=$HOME/models/Qwen3.5-9B \
 DATA_PATH=$HOME/data/swe_agent/r2e_gym.parquet \
 MAX_SAMPLES=1 \
@@ -106,6 +177,24 @@ python examples/swe_agent_blackbox/parallel_infer.py \
     --tensor-parallel-size 1
 ```
 
+### Claude Code runner
+
+```bash
+RUNNER=claude_code \
+SWE_AGENT_TOOL_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest \
+SWE_AGENT_SANDBOX_TYPE=openyuanrong \
+SWE_AGENT_MAX_TURNS=50 \
+SWE_AGENT_RUN_TIMEOUT=7200 \
+MAX_SAMPLES=1 \
+N=1 \
+TP=4 \
+GATEWAY_COUNT=1 \
+MAX_CONCURRENT_SESSIONS=1 \
+bash examples/swe_agent_blackbox/scripts/run_infer.sh
+```
+
+Claude Code 执行后直接在同一个 sandbox 内跑 reward，并通过 `session_runtime.complete_session(..., reward_info=...)` 回传；`parallel_infer.py` 从 TQ 汇总 `per_sample_scores`。
+
 ## 3. 推理（OpenYuanRong 远程沙箱）
 
 ### 环境变量
@@ -123,7 +212,7 @@ RUNNER=mini_swe \
 OPENYUANRONG_SERVER_ADDRESS="6.2.179.37:8888" \
 OPENYUANRONG_TOKEN="<token>" \
 DEPLOYMENT=openyuanrong \
-MINI_SWE_AGENT_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest \
+SWE_AGENT_TOOL_IMAGE=swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest \
 bash examples/swe_agent_blackbox/scripts/run_infer.sh
 ```
 
@@ -161,8 +250,9 @@ bash examples/swe_agent_blackbox/scripts/run_train_megatron_async.sh
 |------|--------|------|
 | `SWE_AGENT_SANDBOX_TYPE` | `"openyuanrong"` | 沙箱类型：`"local"` 或 `"openyuanrong"` |
 | `SWE_AGENT_MAX_TURNS` | `250` | Agent 最大步数 |
+| `SWE_AGENT_RUN_TIMEOUT` | `7200` | Agent 主进程超时（秒） |
 | `SWE_AGENT_EVAL_TIMEOUT` | `600` | Reward 评估超时（秒） |
-| `MINI_SWE_AGENT_IMAGE` | `swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest` | sidecar 工具镜像 |
+| `SWE_AGENT_TOOL_IMAGE` | runner 默认镜像 | sidecar 工具镜像；`mini_swe` 默认 `mini-swe-agent-tool`，`claude_code` 默认 `claude-code-tool` |
 | `N_GPUS_PER_NODE` | `8` | 每节点 GPU 数量 |
 | `DEBUG_MODE` | (unset) | 设为任意值开启 DEBUG 日志 |
 

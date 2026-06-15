@@ -45,7 +45,12 @@ def extract_upstream(gateway_url: str) -> str:
     return f"{parsed.hostname}:{parsed.port}"
 
 
-def rewrite_gateway_url(gateway_url: str, proxy_port: int = DEFAULT_PROXY_PORT) -> str:
+def rewrite_gateway_url(
+    gateway_url: str,
+    proxy_port: int = DEFAULT_PROXY_PORT,
+    *,
+    strip_v1: bool = False,
+) -> str:
     """Rewrite gateway URL to use the sandbox-internal tunnel.
 
     Replaces host:port with 127.0.0.1:<proxy_port>, keeps path intact.
@@ -55,7 +60,8 @@ def rewrite_gateway_url(gateway_url: str, proxy_port: int = DEFAULT_PROXY_PORT) 
         -> "http://127.0.0.1:8766/sessions/abc/v1"
     """
     parsed = urlparse(gateway_url)
-    return f"http://127.0.0.1:{proxy_port}{parsed.path}"
+    path = parsed.path.removesuffix("/v1") if strip_v1 else parsed.path
+    return f"http://127.0.0.1:{proxy_port}{path}"
 
 
 class YRSandboxCommands:
@@ -84,12 +90,13 @@ class YRSandboxCommands:
         cpu_limit: int = 4000,
         mem_limit: int = 8192,
         idle_timeout: int = 600,
+        sidecar_target: str = "/opt/mini-swe-agent",
         **sandbox_kwargs: Any,
     ) -> "YRSandboxCommands":
         """Create an OpenYuanRong sandbox with sidecar tool mounted.
 
-        The sidecar image is mounted at ``/opt/mini-swe-agent`` inside the
-        sandbox via ``akernel_sdk.Mount``.
+        The sidecar image is mounted at ``sidecar_target`` inside the sandbox
+        via ``akernel_sdk.Mount``.
 
         If ``upstream`` is provided, a tunnel is set up so the sandbox can
         reach the local gateway via ``http://127.0.0.1:<proxy_port>``.
@@ -105,7 +112,7 @@ class YRSandboxCommands:
             "mem_limit": mem_limit,
             "idle_timeout": idle_timeout,
             "mounts": [
-                Mount(target="/opt/mini-swe-agent", image_url=sidecar_image),
+                Mount(target=sidecar_target, image_url=sidecar_image),
             ],
         }
         if upstream:
@@ -116,8 +123,8 @@ class YRSandboxCommands:
         sb_kwargs.update(sandbox_kwargs)
 
         logger.info(
-            "Creating YR sandbox (image=%s, cpu=%d, memory=%d, sidecar=%s, upstream=%s)",
-            image, cpu, memory, sidecar_image, upstream or "none",
+            "Creating YR sandbox (image=%s, cpu=%d, memory=%d, sidecar=%s:%s, upstream=%s)",
+            image, cpu, memory, sidecar_image, sidecar_target, upstream or "none",
         )
         sandbox = await asyncio.to_thread(lambda: Sandbox(**sb_kwargs))
         logger.info("YR sandbox created: %s", getattr(sandbox, "sandbox_id", "?"))

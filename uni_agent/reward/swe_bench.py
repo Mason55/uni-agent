@@ -59,9 +59,11 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
     eval_commands += [
         reset_tests_command,
         apply_test_patch_command,
-        f": '{START_TEST_OUTPUT}'",
+        # Emit markers to stdout so blackbox sandbox adapters that only capture
+        # stdout can still delimit the test log reliably.
+        f"printf '%s\\n' '{START_TEST_OUTPUT}'",
         test_command,
-        f": '{END_TEST_OUTPUT}'",
+        f"printf '%s\\n' '{END_TEST_OUTPUT}'",
         reset_tests_command,
     ]
     return eval_commands

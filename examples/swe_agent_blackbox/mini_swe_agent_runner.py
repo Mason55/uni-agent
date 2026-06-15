@@ -34,15 +34,14 @@ if os.environ.get("DEBUG_MODE"):
     logger.setLevel(logging.DEBUG)
 
 
-# Default sidecar image — user can change this or set MINI_SWE_AGENT_IMAGE env var.
-MINI_SWE_AGENT_IMAGE = os.environ.get("MINI_SWE_AGENT_IMAGE", "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest")
+DEFAULT_TOOL_IMAGE = "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest"
 
 
 async def _create_sandbox(
     *,
     image: str,
     sandbox_type: str,
-    sidecar_image: str = MINI_SWE_AGENT_IMAGE,
+    sidecar_image: str = DEFAULT_TOOL_IMAGE,
     gateway_url: str = "",
 ):
     """Create a sandbox with the mini-swe-agent sidecar tool mounted."""
@@ -170,7 +169,7 @@ async def mini_swe_agent_runner(
     sandbox = await _create_sandbox(
         image=image,
         sandbox_type=sandbox_type,
-        sidecar_image=MINI_SWE_AGENT_IMAGE,
+        sidecar_image=os.environ.get("SWE_AGENT_TOOL_IMAGE", DEFAULT_TOOL_IMAGE),
         gateway_url=gateway_url,
     )
     sandbox_id = sandbox.sandbox_id
@@ -211,7 +210,8 @@ async def mini_swe_agent_runner(
         )
         logger.debug("[sample %d] starting agent inside sandbox", sample_index)
         t0 = time.perf_counter()
-        agent_result = await sandbox.run(agent_cmd, timeout=7200)
+        agent_timeout = int(os.environ.get("SWE_AGENT_RUN_TIMEOUT", "7200"))
+        agent_result = await sandbox.run(agent_cmd, timeout=agent_timeout)
         elapsed = time.perf_counter() - t0
         logger.debug(
             "[sample %d] agent process finished: rc=%d (%.1fs)",

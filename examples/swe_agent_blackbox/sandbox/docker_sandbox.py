@@ -30,8 +30,9 @@ class DockerSandboxCommands:
     so both local and remote sandboxes use the same image artifact.
     """
 
-    def __init__(self, container_id: str) -> None:
+    def __init__(self, container_id: str, *, login_shell: bool = False) -> None:
         self._container_id = container_id
+        self._login_shell = login_shell
 
     @property
     def sandbox_id(self) -> str:
@@ -47,14 +48,20 @@ class DockerSandboxCommands:
         container_timeout: str = "2h",
         docker_executable: str = "docker",
         extra_run_args: list[str] | None = None,
+        container_name_prefix: str = "mwea-sandbox",
+        sidecar_source_path: str = "/opt/mini-swe-agent",
+        sidecar_target_path: str = "/opt",
+        sidecar_copy_contents: bool = False,
+        login_shell: bool = False,
     ) -> "DockerSandboxCommands":
         """Create and start a Docker sandbox with the sidecar tool copied in.
 
-        The sidecar venv is copied from the tool image into the sandbox
-        container via ``docker create`` + ``docker cp``, so both local
-        and remote sandboxes use the same ``mini-swe-agent-tool`` image.
+        By default this preserves the mini-swe-agent layout:
+        ``tool:/opt/mini-swe-agent`` -> ``sandbox:/opt/mini-swe-agent``.
+        Claude Code can reuse the same path with
+        ``sidecar_copy_contents=True`` and target ``/opt/claude-code``.
         """
-        container_name = f"mwea-sandbox-{uuid.uuid4().hex[:8]}"
+        container_name = f"{container_name_prefix}-{uuid.uuid4().hex[:8]}"
 
         cmd = [
             docker_executable, "run", "-d",
@@ -79,16 +86,21 @@ class DockerSandboxCommands:
 
         # Copy sidecar tool from tool image into the sandbox container
         if sidecar_image:
-            await _copy_sidecar(sidecar_image, container_id, docker_executable)
+            await _copy_sidecar(
+                sidecar_image=sidecar_image,
+                container_id=container_id,
+                docker_executable=docker_executable,
+                source_path=sidecar_source_path,
+                target_path=sidecar_target_path,
+                copy_contents=sidecar_copy_contents,
+            )
 
-        return cls(container_id=container_id)
+        return cls(container_id=container_id, login_shell=login_shell)
 
     async def run(self, cmd: str, *, timeout: int = 60) -> CommandResult:
         """Execute *cmd* inside the sandbox via ``docker exec``."""
-        exec_cmd = [
-            "docker", "exec",
-            self._container_id, "bash", "-c", cmd,
-        ]
+        shell_arg = "-lc" if self._login_shell else "-c"
+        exec_cmd = ["docker", "exec", self._container_id, "bash", shell_arg, cmd]
         try:
             r = await asyncio.to_thread(
                 lambda: subprocess.run(
@@ -124,37 +136,60 @@ class DockerSandboxCommands:
 
 
 async def _copy_sidecar(
+    *,
     sidecar_image: str,
     container_id: str,
     docker_executable: str = "docker",
+    source_path: str = "/opt/mini-swe-agent",
+    target_path: str = "/opt",
+    copy_contents: bool = False,
 ) -> None:
-    """Copy /opt/mini-swe-agent from the tool image into a running container.
+    """Copy a sidecar path from the tool image into a running container.
 
-    Uses a two-step process: cp from tool container to host tmpdir,
-    then cp from host into the target sandbox container.
+    ``copy_contents=False`` copies the source directory itself under
+    ``target_path``. ``copy_contents=True`` copies source contents into
+    ``target_path``; this supports scratch images mounted at a custom path.
     """
     import tempfile
 
     def _do() -> None:
-        # Create a temporary container from the tool image
         r = subprocess.run(
             [docker_executable, "create", sidecar_image],
             capture_output=True, text=True, timeout=60, check=True,
         )
         tmp_id = r.stdout.strip()
         try:
-            # Step 1: cp from tool container to host tmpdir
             with tempfile.TemporaryDirectory() as tmpdir:
+                if copy_contents:
+                    host_sidecar = f"{tmpdir}/sidecar"
+                    host_target = host_sidecar
+                else:
+                    source_basename = source_path.rstrip("/").rsplit("/", 1)[-1] or "sidecar"
+                    host_sidecar = f"{tmpdir}/{source_basename}"
+                    host_target = tmpdir
                 subprocess.run(
-                    [docker_executable, "cp", f"{tmp_id}:/opt/mini-swe-agent", tmpdir],
+                    [docker_executable, "cp", f"{tmp_id}:{source_path}", host_target],
                     capture_output=True, text=True, timeout=120, check=True,
                 )
-                # Step 2: cp from host into the running sandbox container
+                if copy_contents:
+                    subprocess.run(
+                        [docker_executable, "exec", container_id, "bash", "-lc", f"mkdir -p {shlex.quote(target_path)}"],
+                        capture_output=True, text=True, timeout=120, check=True,
+                    )
+                    copy_source = f"{host_sidecar}/."
+                else:
+                    copy_source = host_sidecar
                 subprocess.run(
-                    [docker_executable, "cp", f"{tmpdir}/mini-swe-agent", f"{container_id}:/opt/"],
+                    [docker_executable, "cp", copy_source, f"{container_id}:{target_path}/"],
                     capture_output=True, text=True, timeout=120, check=True,
                 )
-            logger.info("Copied sidecar from %s into sandbox %s", sidecar_image, container_id[:12])
+            logger.info(
+                "Copied sidecar %s:%s -> %s:%s",
+                sidecar_image,
+                source_path,
+                container_id[:12],
+                target_path,
+            )
         finally:
             subprocess.run(
                 [docker_executable, "rm", tmp_id],

@@ -35,6 +35,10 @@ class TestModuleImports:
         from examples.swe_agent_blackbox.mini_swe_agent_runner import mini_swe_agent_runner
         assert mini_swe_agent_runner is not None
 
+    def test_claude_code_runner_import(self):
+        from examples.swe_agent_blackbox.claude_code_runner import claude_code_runner
+        assert claude_code_runner is not None
+
     def test_reward_import(self):  # #4
         from examples.swe_agent_blackbox.reward import compute_score, evaluate_in_env
         assert compute_score is not None

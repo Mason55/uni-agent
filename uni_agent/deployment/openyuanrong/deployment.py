@@ -74,14 +74,7 @@ def _create_sandbox(config: YRDeploymentConfig) -> Any:
     return Sandbox(**kwargs)
 
 
-def _swerex_remote_log_path() -> str:
-    return os.getenv("OPENYUANRONG_SWEREX_REMOTE_LOG_PATH", DEFAULT_SWEREX_REMOTE_LOG_PATH).strip()
-
-
 def _local_swerex_log_dir() -> Path:
-    configured = os.getenv("OPENYUANRONG_SWEREX_LOCAL_LOG_DIR")
-    if configured:
-        return Path(configured).expanduser()
     run_infer = Path.cwd() / "examples/swe_agent_blackbox/scripts/run_infer.sh"
     if run_infer.exists():
         return run_infer.parent
@@ -119,7 +112,7 @@ def _start_swerex_via_port_forwarding(
     2. commands.run(server_cmd, background=True)  — start swerex on the forwarded port
     3. get_port_url(port) — gateway URL for RemoteRuntime
     """
-    log_path = log_path or _swerex_remote_log_path()
+    log_path = log_path or DEFAULT_SWEREX_REMOTE_LOG_PATH
     quoted_log_path = shlex.quote(log_path)
     command_with_logs = f"rm -f {quoted_log_path}; ( {command} ) > {quoted_log_path} 2>&1"
     handle = sandbox.commands.run(command_with_logs, background=True)
@@ -318,7 +311,7 @@ class YRDeployment(AbstractDeployment):
         loop = asyncio.get_running_loop()
         token = self._get_token()
         swerex_cmd = self._swerex_start_command(token)
-        swerex_remote_log_path = _swerex_remote_log_path()
+        swerex_remote_log_path = DEFAULT_SWEREX_REMOTE_LOG_PATH
 
         self.logger.info(
             f"Starting YR sandbox (port={self._port}, port_forwardings=[{self._port}], "

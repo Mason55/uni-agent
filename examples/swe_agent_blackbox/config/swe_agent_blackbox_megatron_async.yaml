@@ -51,7 +51,7 @@ actor_rollout_ref:
     custom:
       agent_framework:
         framework_class_fqn: examples.swe_agent_blackbox.framework.SWEAgentFramework
-        agent_runner_fqn: examples.swe_agent_blackbox.agent_runner.swe_agent_runner
+        agent_runner_fqn: examples.swe_agent_blackbox.mini_swe_agent_runner.mini_swe_agent_runner
         gateway_count: 1
         completion_timeout_seconds: 600
         max_concurrent_sessions: 32

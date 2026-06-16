@@ -53,6 +53,11 @@ MAX_TURNS="${MAX_TURNS:-100}"
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-examples/swe_agent_blackbox/config/agent_config.yaml}"
 COMPLETION_TIMEOUT="${COMPLETION_TIMEOUT:-600}"
 
+# ── OpenYuanRong (YR remote sandbox) ─────────────────────────────────────
+OPENYUANRONG_SERVER_ADDRESS="${OPENYUANRONG_SERVER_ADDRESS:-}"
+OPENYUANRONG_TOKEN="${OPENYUANRONG_TOKEN:-}"
+OPENYUANRONG_TUNNEL_SSL_VERIFY="${OPENYUANRONG_TUNNEL_SSL_VERIFY:-0}"
+
 # ── Async training ───────────────────────────────────────────────────────
 TOTAL_ROLLOUT_STEPS="${TOTAL_ROLLOUT_STEPS:-100000}"
 STALENESS_THRESHOLD="${STALENESS_THRESHOLD:-1.0}"
@@ -68,6 +73,9 @@ CKPTS_DIR="${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 
 export SWE_AGENT_MAX_TURNS="${MAX_TURNS}"
 export SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
+export OPENYUANRONG_SERVER_ADDRESS
+export OPENYUANRONG_TOKEN
+export OPENYUANRONG_TUNNEL_SSL_VERIFY
 
 echo "=== SWE-Agent Blackbox Megatron Async Training ==="
 echo "Model:       ${MODEL_PATH}"

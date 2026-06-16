@@ -32,7 +32,7 @@ def _configure_akernel_env() -> None:
     """Map OPENYUANRONG_* env vars to AKERNEL_* before importing akernel_sdk."""
     server = os.getenv("OPENYUANRONG_SERVER_ADDRESS")
     token = os.getenv("OPENYUANRONG_TOKEN")
-    os.environ.setdefault("TUNNEL_SSL_VERIFY", "0")
+    tunnel_ssl_verify = os.getenv("OPENYUANRONG_TUNNEL_SSL_VERIFY", "0")
     if not server or not token:
         raise ValueError(
             "OPENYUANRONG_SERVER_ADDRESS and OPENYUANRONG_TOKEN "
@@ -40,6 +40,7 @@ def _configure_akernel_env() -> None:
         )
     os.environ["AKERNEL_SERVER_ADDRESS"] = server
     os.environ["AKERNEL_TOKEN"] = token
+    os.environ["TUNNEL_SSL_VERIFY"] = tunnel_ssl_verify
 
 
 def extract_upstream(gateway_url: str) -> str:
@@ -88,7 +89,7 @@ class YRSandbox:
         memory: int = 2048,
         cpu_limit: int = 4000,
         mem_limit: int = 8192,
-        idle_timeout: int = 600,
+        idle_timeout: int = 7200,
         **sandbox_kwargs: Any,
     ) -> "YRSandbox":
         """Create an OpenYuanRong sandbox with sidecar tool mounted.
@@ -128,7 +129,7 @@ class YRSandbox:
         logger.info("YR sandbox created: %s", getattr(sandbox, "sandbox_id", "?"))
         return cls(sandbox=sandbox)
 
-    async def run(self, cmd: str, *, timeout: int = 60) -> CommandResult:
+    async def run(self, cmd: str, *, timeout: int = 600) -> CommandResult:
         """Execute *cmd* inside the OpenYuanRong sandbox via ``sandbox.commands.run``."""
         try:
             result = await asyncio.to_thread(

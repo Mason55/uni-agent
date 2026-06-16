@@ -35,7 +35,7 @@ class SandboxEnvForReward:
     def __init__(self, sandbox):
         self._sandbox = sandbox
 
-    async def communicate(self, input: str, timeout=60, check="ignore", error_msg="Command failed") -> str:
+    async def communicate(self, input: str, timeout=600, check="ignore", error_msg="Command failed") -> str:
         result = await self._sandbox.run(input, timeout=int(timeout))
         if check == "raise" and result.exit_code != 0:
             raise RuntimeError(f"{error_msg}: {result.stdout[:200]}")
@@ -129,7 +129,7 @@ async def mini_swe_agent_runner(
         post_setup_cmd = env_config.get("post_setup_cmd", "")
         if post_setup_cmd:
             logger.info("Running post_setup_cmd (%d chars)...", len(post_setup_cmd))
-            r = await sandbox.run(post_setup_cmd, timeout=120)
+            r = await sandbox.run(post_setup_cmd, timeout=600)
             if r.exit_code != 0:
                 logger.warning("post_setup_cmd failed (rc=%d): %s", r.exit_code, r.stdout[:200])
             else:

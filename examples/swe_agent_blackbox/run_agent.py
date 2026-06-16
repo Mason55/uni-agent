@@ -15,6 +15,8 @@ import json
 import os
 import sys
 
+DEFAULT_ACTION_TIMEOUT = 600
+
 
 def _fail(msg: str, exit_status: str = "error") -> None:
     """Write error result to stdout and exit."""
@@ -40,6 +42,7 @@ def main() -> None:
 
         env_cfg = dict(swebench_cfg.get("environment", {}))
         env_cfg.pop("environment_class", None)
+        env_cfg["timeout"] = DEFAULT_ACTION_TIMEOUT
         env_cfg.setdefault("env", {})
         env_cfg["env"].setdefault("GIT_PAGER", "cat")
         for key in ("image", "container_timeout", "run_args", "executable", "pull_timeout",

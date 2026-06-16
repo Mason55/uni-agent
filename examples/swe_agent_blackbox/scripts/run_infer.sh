@@ -25,7 +25,6 @@ N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 RUNNER="${RUNNER:-uniagent}"
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-examples/swe_agent_blackbox/config/agent_config.yaml}"
 export SWE_AGENT_MAX_TURNS="${SWE_AGENT_MAX_TURNS:-100}"
-export SWE_AGENT_ACTION_TIMEOUT="${SWE_AGENT_ACTION_TIMEOUT:-300}"
 export SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
 
 # ── Logging ──────────────────────────────────────────────────────────────

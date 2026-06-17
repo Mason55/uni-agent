@@ -21,7 +21,9 @@ export CLAUDE_CODE_TIMEOUT="${CLAUDE_CODE_TIMEOUT:-7200}"
 export SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 
-cd "$(dirname "$0")/../.."
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+cd "${REPO_ROOT}"
 
 python examples/claude_code_swe/parallel_infer.py \
     --model-path "${MODEL_PATH}" \

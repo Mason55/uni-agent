@@ -67,10 +67,10 @@ class ClaudeDockerSandbox:
         docker_executable: str = "docker",
     ) -> "ClaudeDockerSandbox":
         container_name = f"claude-swe-sandbox-{uuid.uuid4().hex[:8]}"
-        cmd = [docker_executable, "run", "-d", "--name", container_name]
+        cmd = [docker_executable, "run", "-d", "--name", container_name, "--entrypoint", "sleep"]
         for key, value in (env or {}).items():
             cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend([image, "sleep", container_timeout])
+        cmd.extend([image, container_timeout])
 
         r = await asyncio.to_thread(
             lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)

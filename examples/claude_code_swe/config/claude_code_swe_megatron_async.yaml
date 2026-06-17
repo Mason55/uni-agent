@@ -1,0 +1,152 @@
+# Fully async Megatron PPO config for Claude Code SWE recipe.
+# Keeps recipe-specific agent framework wiring local to this directory.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+async_training:
+  staleness_threshold: 0.1
+  trigger_parameter_sync_step: 4
+  require_batches: 1
+  partial_rollout: True
+  use_trainer_do_validate: False
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+  n: 4
+  total_rollout_steps: 100
+
+actor_rollout_ref:
+  hybrid_engine: false
+  nccl_timeout: 9600
+
+  model:
+    path: ???
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+
+  rollout:
+    name: vllm
+    mode: async
+    prompt_length: 4096
+    response_length: 131072
+    max_model_len: 135168
+    temperature: 1.0
+    top_p: 1.0
+    n: 8
+    tensor_model_parallel_size: 4
+    data_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.7
+    calculate_log_probs: true
+    free_cache_engine: true
+
+    checkpoint_engine:
+      backend: nccl
+
+    multi_turn:
+      enable: true
+      max_assistant_turns: 1
+      max_parallel_calls: 1
+      format: qwen3_coder
+
+    agent:
+      num_workers: 8
+      agent_loop_manager_class: uni_agent.trainer.framework.entry.AgentFrameworkRolloutAdapter
+
+    custom:
+      agent_framework:
+        framework_class_fqn: examples.claude_code_swe.framework.ClaudeCodeSWEFramework
+        agent_runner_fqn: examples.claude_code_swe.claude_code_runner.claude_code_runner
+        gateway_count: 1
+        completion_timeout_seconds: 7200
+        max_concurrent_sessions: 32
+
+  actor:
+    use_rollout_log_probs: true
+    use_dynamic_bsz: true
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    loss_agg_mode: token-mean
+    ppo_mini_batch_size: 16
+    optim:
+      lr: 1e-6
+      weight_decay: 0.1
+      clip_grad: 1.0
+    megatron:
+      tensor_model_parallel_size: 4
+      context_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      virtual_pipeline_model_parallel_size: null
+      expert_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      param_offload: true
+      optimizer_offload: true
+      grad_offload: true
+      use_mbridge: true
+
+data:
+  train_files: ???
+  val_files: ???
+  gen_batch_size: 1
+  train_batch_size: 0
+  val_batch_size: 128
+  max_prompt_length: 4096
+  max_response_length: 131072
+  return_raw_chat: true
+  trust_remote_code: true
+  custom_cls:
+    path: pkg://examples.swe_agent_blackbox.dataset
+    name: SWEBenchDataset
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_mode: True
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+
+reward:
+  custom_reward_function:
+    path: pkg://examples/swe_agent_blackbox.reward
+    name: compute_score
+
+trainer:
+  use_legacy_worker_impl: disable
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_epochs: 1
+  project_name: claude_code_swe_async
+  experiment_name: claude_code_swe_async
+  logger:
+    - console
+  device: cuda
+  balance_batch: false
+  val_before_train: true
+  val_only: false
+  save_freq: 10
+  test_freq: 10
+  default_local_dir: checkpoints/claude_code_swe_async
+  resume_mode: auto
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        TRANSFER_QUEUE_ENABLE: ""
+        NCCL_P2P_DISABLE: "1"
+        NCCL_SHM_DISABLE: "1"

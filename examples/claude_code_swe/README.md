@@ -91,9 +91,41 @@ N_GPUS_PER_NODE=2 \
 bash examples/claude_code_swe/run_infer.sh
 ```
 
+Train with `verl.trainer.main_ppo_sync`:
+
+```bash
+CLAUDE_CODE_IMAGE=claude-code-tool:latest \
+CLAUDE_CODE_SANDBOX_TYPE=openyuanrong \
+MODEL_PATH=/data1/models/Qwen/Qwen3.5-4B \
+TRAIN_DATA=/home/datasets/swe_bench_verified_openyuanrong.parquet \
+VAL_DATA=/home/datasets/swe_bench_verified_openyuanrong.parquet \
+TP=2 \
+NGPUS_PER_NODE=2 \
+bash examples/claude_code_swe/scripts/run_train.sh
+```
+
+Fully async Megatron training:
+
+```bash
+CLAUDE_CODE_IMAGE=claude-code-tool:latest \
+CLAUDE_CODE_SANDBOX_TYPE=openyuanrong \
+MODEL_PATH=/data1/models/Qwen/Qwen3.5-4B \
+TRAIN_DATA=/home/datasets/swe_bench_verified_openyuanrong.parquet \
+VAL_DATA=/home/datasets/swe_bench_verified_openyuanrong.parquet \
+NGPUS_PER_NODE=8 \
+TRAIN_TP=4 \
+GEN_TP=4 \
+TOTAL_ROLLOUT_STEPS=100 \
+bash examples/claude_code_swe/scripts/run_train_megatron_async.sh
+```
+
 Key files:
 
 - `claude_code_runner.py`: creates sandbox, runs Claude Code, evaluates reward.
 - `sandbox.py`: local Docker and OpenYuanRong sandbox helpers with `/opt/claude-code` sidecar target.
 - `framework.py`: small framework subclass that passes Anthropic-style `base_url` to the runner.
 - `parallel_infer.py`: minimal inference entrypoint for Claude Code.
+- `config/claude_code_swe.yaml`: PPO training config for Claude Code rollout.
+- `config/claude_code_swe_megatron_async.yaml`: fully async Megatron PPO config.
+- `scripts/run_train.sh`: synchronous PPO training launch script.
+- `scripts/run_train_megatron_async.sh`: fully async Megatron training launch script.

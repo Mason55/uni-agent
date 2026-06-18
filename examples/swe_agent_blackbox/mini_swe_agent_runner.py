@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 if os.environ.get("DEBUG_MODE"):
     logger.setLevel(logging.DEBUG)
 
-MINI_SWE_AGENT_IMAGE = os.environ.get("MINI_SWE_AGENT_IMAGE", "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest")
+DEFAULT_TOOL_IMAGE = "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest"
 
 
 class SandboxEnvForReward:
@@ -83,6 +83,8 @@ async def mini_swe_agent_runner(
     sample_index: int,
     session_runtime: SessionRuntime,
     tools_kwargs: dict | None = None,
+    tool_image: str = DEFAULT_TOOL_IMAGE,
+    run_timeout: int = 7200,
     **kwargs,
 ) -> None:
     """Run mini-swe-agent inside a sandbox with sidecar tool mount.
@@ -113,7 +115,7 @@ async def mini_swe_agent_runner(
 
     upstream = extract_upstream(gateway_url)
     sandbox = await YRSandbox.create(
-        image=image, sidecar_image=MINI_SWE_AGENT_IMAGE, upstream=upstream,
+        image=image, sidecar_image=tool_image, upstream=upstream,
     )
     sandbox_id = sandbox.sandbox_id
     logger.info("Sandbox created (image=%s, sandbox_id=%s)", image, sandbox_id)
@@ -144,7 +146,7 @@ async def mini_swe_agent_runner(
         )
         logger.debug("[sample %d] starting agent inside sandbox", sample_index)
         t0 = time.perf_counter()
-        agent_result = await sandbox.run(agent_cmd, timeout=7200)
+        agent_result = await sandbox.run(agent_cmd, timeout=int(run_timeout))
         elapsed = time.perf_counter() - t0
         logger.debug(
             "[sample %d] agent process finished: rc=%d (%.1fs)",

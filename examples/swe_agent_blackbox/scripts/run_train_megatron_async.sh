@@ -49,9 +49,33 @@ USE_MBRIDGE="${USE_MBRIDGE:-True}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 
 # ── Agent parameters ─────────────────────────────────────────────────────
+RUNNER="${RUNNER:-mini_swe}"
 MAX_TURNS="${MAX_TURNS:-100}"
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-examples/swe_agent_blackbox/config/agent_config.yaml}"
 COMPLETION_TIMEOUT="${COMPLETION_TIMEOUT:-600}"
+if [[ "${RUNNER}" == "claude_code" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.claude_code_runner.claude_code_runner"
+    SWE_AGENT_TOOL_IMAGE="${SWE_AGENT_TOOL_IMAGE:-claude-code-tool:latest}"
+elif [[ "${RUNNER}" == "mini_swe" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.mini_swe_agent_runner.mini_swe_agent_runner"
+    SWE_AGENT_TOOL_IMAGE="${SWE_AGENT_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest}"
+elif [[ "${RUNNER}" == "uniagent" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.agent_runner.swe_agent_runner"
+    SWE_AGENT_TOOL_IMAGE=""
+else
+    echo "Unknown RUNNER=${RUNNER}; expected mini_swe, claude_code, or uniagent" >&2
+    exit 1
+fi
+SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
+RUNNER_ARGS=(
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runner_fqn=${AGENT_RUNNER_FQN}"
+)
+if [[ "${RUNNER}" != "uniagent" ]]; then
+    RUNNER_ARGS+=(
+        "+actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.tool_image=${SWE_AGENT_TOOL_IMAGE}"
+        "+actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.run_timeout=${SWE_AGENT_RUN_TIMEOUT}"
+    )
+fi
 
 # ── OpenYuanRong (YR remote sandbox) ─────────────────────────────────────
 OPENYUANRONG_SERVER_ADDRESS="${OPENYUANRONG_SERVER_ADDRESS:-}"
@@ -82,6 +106,7 @@ echo "Model:       ${MODEL_PATH}"
 echo "Train data:  ${TRAIN_DATA}"
 echo "Val data:    ${VAL_DATA}"
 echo "Engine:      ${ENGINE} (gen_tp=${GEN_TP}, train_tp=${TRAIN_TP})"
+echo "Runner:      ${RUNNER}"
 echo "Batch:       n=${N}, mini_bsz=${PPO_MINI_BATCH_SIZE}"
 echo "Sequence:    prompt=${PROMPT_LENGTH}, response=${RESPONSE_LENGTH}"
 echo "Nodes:       train=${NNODES_TRAIN}, rollout=${NNODES_ROLLOUT}"
@@ -130,6 +155,7 @@ ray job submit --no-wait --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}"
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${MAX_TURNS} \
     actor_rollout_ref.rollout.custom.agent_framework.completion_timeout_seconds=${COMPLETION_TIMEOUT} \
     actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.agent_config_path="${AGENT_CONFIG_PATH}" \
+    "${RUNNER_ARGS[@]}" \
     actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW} \
     actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \

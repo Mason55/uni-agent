@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 # "stop_sequences" is renamed to OpenAI's "stop" (only honored when the
 # gateway operator adds "stop" to allowed_request_sampling_param_keys).
 _PASSTHROUGH_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "max_tokens")
+
+_CLAUDE_CODE_BILLING_HEADER_RE = re.compile(
+    r"^\s*x-anthropic-billing-header:[^\n]*\n?",
+    re.IGNORECASE,
+)
 
 # OpenAI finish_reason -> Anthropic stop_reason.
 _STOP_REASON_MAP = {
@@ -66,9 +72,9 @@ def _join_text_blocks(blocks: list[Any], *, context: str) -> str:
 
 def _convert_system(system: Any) -> str:
     if isinstance(system, str):
-        return system
+        return _CLAUDE_CODE_BILLING_HEADER_RE.sub("", system)
     if isinstance(system, list):
-        return _join_text_blocks(system, context="system")
+        return _CLAUDE_CODE_BILLING_HEADER_RE.sub("", _join_text_blocks(system, context="system"))
     raise MalformedRequestError("system must be a string or a list of text blocks")
 
 
@@ -199,6 +205,116 @@ def _convert_assistant_message(content: Any) -> dict[str, Any]:
     return message
 
 
+def _infer_json_schema_type(schema: dict[str, Any]) -> str:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type
+    if isinstance(schema_type, list) and schema_type:
+        non_null = [item for item in schema_type if item != "null"]
+        if non_null:
+            return str(non_null[0])
+        return str(schema_type[0])
+
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, dict):
+                    variant_type = _infer_json_schema_type(variant)
+                    if variant_type:
+                        return variant_type
+
+    if "const" in schema:
+        value = schema["const"]
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int | float):
+            return "number"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "string"
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        value = next((item for item in enum if item is not None), enum[0])
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int | float):
+            return "number"
+        return "string"
+
+    if "properties" in schema or "additionalProperties" in schema:
+        return "object"
+    if "items" in schema:
+        return "array"
+    return "string"
+
+
+def _collect_json_schema_enum(schema: dict[str, Any]) -> list[Any] | None:
+    enum_values: list[Any] = []
+    if isinstance(schema.get("enum"), list):
+        enum_values.extend(schema["enum"])
+    if "const" in schema:
+        enum_values.append(schema["const"])
+
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            variant_enum = _collect_json_schema_enum(variant)
+            if variant_enum:
+                enum_values.extend(variant_enum)
+
+    if not enum_values:
+        return None
+
+    deduped: list[Any] = []
+    for value in enum_values:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _normalize_openai_property_schema(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {"type": "string", "description": str(schema)}
+
+    normalized: dict[str, Any] = {"type": _infer_json_schema_type(schema)}
+    if isinstance(schema.get("description"), str):
+        normalized["description"] = schema["description"]
+    enum = _collect_json_schema_enum(schema)
+    if enum is not None:
+        normalized["enum"] = enum
+    return normalized
+
+
+def _normalize_openai_parameters_schema(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}, "required": []}
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+
+    required = schema.get("required")
+    if not isinstance(required, list):
+        required = []
+
+    return {
+        "type": "object",
+        "properties": {
+            str(name): _normalize_openai_property_schema(property_schema)
+            for name, property_schema in properties.items()
+        },
+        "required": [str(name) for name in required],
+    }
+
+
 def _convert_tools(tools: Any) -> list[dict[str, Any]] | None:
     if tools is None:
         return None
@@ -216,11 +332,10 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]] | None:
         if not tool.get("name"):
             raise MalformedRequestError("tool requires a name")
         function: dict[str, Any] = {
-            "name": tool["name"],
-            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            "name": str(tool["name"]),
+            "description": str(tool.get("description") or ""),
+            "parameters": _normalize_openai_parameters_schema(tool.get("input_schema")),
         }
-        if tool.get("description"):
-            function["description"] = tool["description"]
         converted.append({"type": "function", "function": function})
     return converted
 
@@ -230,27 +345,31 @@ def anthropic_payload_to_openai(payload: dict[str, Any]) -> dict[str, Any]:
     Chat Completions payload shape consumed by the gateway."""
     if not isinstance(payload, dict):
         raise MalformedRequestError("request body must be a JSON object")
-    if payload.get("stream"):
-        raise MalformedRequestError("streaming is not supported by the gateway; set stream=False")
 
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise MalformedRequestError("messages must be non-empty")
 
+    system_texts: list[str] = []
     messages: list[dict[str, Any]] = []
     if payload.get("system") is not None:
-        messages.append({"role": "system", "content": _convert_system(payload["system"])})
+        system_texts.append(_convert_system(payload["system"]))
 
     for message in raw_messages:
         if not isinstance(message, dict):
             raise MalformedRequestError("messages entries must be objects")
         role = message.get("role")
-        if role == "user":
+        if role == "system":
+            system_texts.append(_convert_system(message.get("content")))
+        elif role == "user":
             messages.extend(_convert_user_message(message.get("content")))
         elif role == "assistant":
             messages.append(_convert_assistant_message(message.get("content")))
         else:
             raise MalformedRequestError(f"unsupported message role: {role!r}")
+
+    if system_texts:
+        messages.insert(0, {"role": "system", "content": "\n".join(system_texts)})
 
     openai_payload: dict[str, Any] = {"messages": messages}
     tools = _convert_tools(payload.get("tools"))
@@ -330,3 +449,79 @@ def anthropic_error_body(status_code: int, message: str) -> dict[str, Any]:
             "message": message,
         },
     }
+
+
+def anthropic_stream_events(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build Anthropic Messages SSE events from a non-streaming Message body.
+
+    The gateway backend currently generates a whole assistant turn at once.
+    For clients that require Anthropic streaming, emit a valid SSE event
+    sequence with the generated content split by content block.
+    """
+    content = list(message.get("content") or [])
+    start_message = dict(message)
+    start_message["content"] = []
+
+    events: list[dict[str, Any]] = [
+        {"type": "message_start", "message": start_message},
+    ]
+    for index, block in enumerate(content):
+        block_type = block.get("type")
+        if block_type == "text":
+            events.append(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            )
+            text = block.get("text", "")
+            if text:
+                events.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text},
+                    }
+                )
+            events.append({"type": "content_block_stop", "index": index})
+        elif block_type == "tool_use":
+            events.append(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.get("id"),
+                        "name": block.get("name", ""),
+                        "input": {},
+                    },
+                }
+            )
+            input_json = json.dumps(block.get("input") or {}, ensure_ascii=False)
+            if input_json:
+                events.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": input_json},
+                    }
+                )
+            events.append({"type": "content_block_stop", "index": index})
+
+    events.append(
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": message.get("stop_reason"),
+                "stop_sequence": message.get("stop_sequence"),
+            },
+            "usage": {"output_tokens": int((message.get("usage") or {}).get("output_tokens", 0))},
+        }
+    )
+    events.append({"type": "message_stop"})
+    return events
+
+
+def encode_anthropic_sse_event(event: dict[str, Any]) -> str:
+    return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"

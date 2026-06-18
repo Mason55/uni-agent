@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ from uni_agent.trainer.gateway.runtime import GatewayServingRuntime
 
 from examples.swe_agent_blackbox.framework import SWEAgentFramework
 from examples.swe_agent_blackbox.agent_runner import swe_agent_runner
+from examples.swe_agent_blackbox.claude_code_runner import claude_code_runner
 
 try:
     from examples.swe_agent_blackbox.mini_swe_agent_runner import mini_swe_agent_runner
@@ -140,16 +142,29 @@ def run_inference(
     n_gpus_per_node: int = 8,
     tensor_parallel_size: int = 4,
     gateway_count: int = 1,
+    max_concurrent_sessions: int = 2,
     completion_timeout: float = 600.0,
     tool_parser: str | None = None,
     agent_config_path: str | None = None,
     runner: str = "uniagent",
+    tool_image: str | None = None,
+    run_timeout: int = 7200,
 ) -> dict[str, Any]:
     """Run parallel SWE-agent inference using the blackbox framework."""
     if runner == "mini_swe":
         if mini_swe_agent_runner is None:
             raise ImportError("mini-swe-agent is required for --runner mini_swe. Install with: pip install mini-swe-agent")
-        _agent_runner = mini_swe_agent_runner
+        _agent_runner = partial(
+            mini_swe_agent_runner,
+            tool_image=tool_image or "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest",
+            run_timeout=run_timeout,
+        )
+    elif runner == "claude_code":
+        _agent_runner = partial(
+            claude_code_runner,
+            tool_image=tool_image or "claude-code-tool:latest",
+            run_timeout=run_timeout,
+        )
     else:
         _agent_runner = swe_agent_runner
 
@@ -172,7 +187,14 @@ def run_inference(
 
     # 2. Load dataset
     samples = load_swe_dataset(data_path, max_samples=max_samples)
-    logger.info("Loaded %d samples, %d rollout(s) each", len(samples), n)
+    logger.info(
+        "Loaded %d samples, %d rollout(s) each, runner=%s, gateway_count=%d, max_concurrent_sessions=%d",
+        len(samples),
+        n,
+        runner,
+        gateway_count,
+        max_concurrent_sessions,
+    )
 
     if not samples:
         raise ValueError("No samples to process")
@@ -210,7 +232,7 @@ def run_inference(
         rollout_config={"n": n, "val_kwargs": {"n": n}},
         completion_timeout=completion_timeout,
         wait_for_completion_after_agent_run=True,
-        max_concurrent_sessions=2,
+        max_concurrent_sessions=max_concurrent_sessions,
         reward_loop_worker_handles=[reward_worker],
     )
 
@@ -218,7 +240,7 @@ def run_inference(
     _tools_kwargs_list = []
     for sample in samples:
         tk = (sample.get("extra_info") or {}).get("tools_kwargs", {})
-        if agent_config_path:
+        if runner == "uniagent" and agent_config_path:
             tk["agent_config_path"] = agent_config_path
         tk["model_path"] = os.path.expanduser(model_path)
         _tools_kwargs_list.append(tk)
@@ -336,7 +358,7 @@ def _init_hydra_config(
     config.actor_rollout_ref.rollout.max_model_len = prompt_length + response_length + 1024
     config.actor_rollout_ref.rollout.n = n
     config.actor_rollout_ref.rollout.tensor_model_parallel_size = tensor_parallel_size
-    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = float(os.getenv("ROLLOUT_GPU_MEM_UTIL", "0.5"))
     config.actor_rollout_ref.rollout.temperature = temperature
     config.actor_rollout_ref.rollout.top_p = top_p
     config.actor_rollout_ref.rollout.val_kwargs.temperature = temperature
@@ -355,6 +377,7 @@ def _init_hydra_config(
 
     OmegaConf.set_struct(config.actor_rollout_ref.rollout, False)
     config.actor_rollout_ref.rollout.enable_sleep_mode = False
+    config.actor_rollout_ref.rollout.enforce_eager = os.getenv("ROLLOUT_ENFORCE_EAGER", "0") == "1"
     OmegaConf.set_struct(config.actor_rollout_ref.rollout, True)
     return config
 
@@ -379,10 +402,14 @@ def main():
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--n-gpus-per-node", type=int, default=8)
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=4)
+    parser.add_argument("--gateway-count", type=int, default=1)
+    parser.add_argument("--max-concurrent-sessions", type=int, default=2)
     parser.add_argument("--tool-parser", type=str, default="qwen3_coder")
+    parser.add_argument("--tool-image", type=str, default=None)
+    parser.add_argument("--run-timeout", type=int, default=7200)
     parser.add_argument(
-        "--runner", type=str, default="uniagent", choices=["uniagent", "mini_swe"],
-        help="Agent runner: 'uniagent' or 'mini_swe'.",
+        "--runner", type=str, default="uniagent", choices=["uniagent", "mini_swe", "claude_code"],
+        help="Agent runner: 'uniagent', 'mini_swe', or 'claude_code'.",
     )
     parser.add_argument(
         "--agent-config-path", type=str,
@@ -406,9 +433,13 @@ def main():
         nnodes=args.nnodes,
         n_gpus_per_node=args.n_gpus_per_node,
         tensor_parallel_size=args.tensor_parallel_size,
+        gateway_count=args.gateway_count,
+        max_concurrent_sessions=args.max_concurrent_sessions,
         tool_parser=args.tool_parser,
         agent_config_path=args.agent_config_path,
         runner=args.runner,
+        tool_image=args.tool_image,
+        run_timeout=args.run_timeout,
     )
 
 

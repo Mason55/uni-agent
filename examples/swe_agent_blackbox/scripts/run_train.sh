@@ -37,9 +37,33 @@ N="${N:-8}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 
 # ── Agent parameters ─────────────────────────────────────────────────────
+RUNNER="${RUNNER:-mini_swe}"
 MAX_TURNS="${MAX_TURNS:-100}"
 AGENT_CONFIG_PATH="${AGENT_CONFIG_PATH:-examples/swe_agent_blackbox/config/agent_config.yaml}"
 COMPLETION_TIMEOUT="${COMPLETION_TIMEOUT:-600}"
+if [[ "${RUNNER}" == "claude_code" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.claude_code_runner.claude_code_runner"
+    SWE_AGENT_TOOL_IMAGE="${SWE_AGENT_TOOL_IMAGE:-claude-code-tool:latest}"
+elif [[ "${RUNNER}" == "mini_swe" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.mini_swe_agent_runner.mini_swe_agent_runner"
+    SWE_AGENT_TOOL_IMAGE="${SWE_AGENT_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest}"
+elif [[ "${RUNNER}" == "uniagent" ]]; then
+    AGENT_RUNNER_FQN="examples.swe_agent_blackbox.agent_runner.swe_agent_runner"
+    SWE_AGENT_TOOL_IMAGE=""
+else
+    echo "Unknown RUNNER=${RUNNER}; expected mini_swe, claude_code, or uniagent" >&2
+    exit 1
+fi
+SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
+RUNNER_ARGS=(
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runner_fqn=${AGENT_RUNNER_FQN}"
+)
+if [[ "${RUNNER}" != "uniagent" ]]; then
+    RUNNER_ARGS+=(
+        "+actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.tool_image=${SWE_AGENT_TOOL_IMAGE}"
+        "+actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.run_timeout=${SWE_AGENT_RUN_TIMEOUT}"
+    )
+fi
 
 # ── Logging ──────────────────────────────────────────────────────────────
 PROJECT_NAME="${PROJECT_NAME:-swe_agent_blackbox}"
@@ -59,6 +83,7 @@ echo "Model:       ${MODEL_PATH}"
 echo "Train data:  ${TRAIN_DATA}"
 echo "Val data:    ${VAL_DATA}"
 echo "Engine:      ${ENGINE} (TP=${TP})"
+echo "Runner:      ${RUNNER}"
 echo "Batch size:  ${TRAIN_BATCH_SIZE}, N=${N}"
 echo "Epochs:      ${TOTAL_EPOCHS}"
 echo "====================================="
@@ -93,4 +118,5 @@ python3 -m verl.trainer.main_ppo_sync \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.agent_config_path="${AGENT_CONFIG_PATH}" \
     actor_rollout_ref.rollout.custom.agent_framework.completion_timeout_seconds=${COMPLETION_TIMEOUT} \
+    "${RUNNER_ARGS[@]}" \
     "$@"

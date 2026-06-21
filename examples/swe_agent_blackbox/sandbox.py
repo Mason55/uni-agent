@@ -90,6 +90,7 @@ class YRSandbox:
         cpu_limit: int = 4000,
         mem_limit: int = 8192,
         idle_timeout: int = 7200,
+        max_retries: int = 5,
         **sandbox_kwargs: Any,
     ) -> "YRSandbox":
         """Create an OpenYuanRong sandbox with sidecar tool mounted.
@@ -125,9 +126,31 @@ class YRSandbox:
             "Creating YR sandbox (image=%s, cpu=%d, memory=%d, sidecar=%s, upstream=%s)",
             image, cpu, memory, sidecar_image, upstream or "none",
         )
-        sandbox = await asyncio.to_thread(lambda: Sandbox(**sb_kwargs))
-        logger.info("YR sandbox created: %s", getattr(sandbox, "sandbox_id", "?"))
-        return cls(sandbox=sandbox)
+        last_error: Exception | None = None
+        for retry in range(max_retries):
+            sandbox = None
+            try:
+                sandbox = await asyncio.to_thread(lambda: Sandbox(**sb_kwargs))
+                logger.info("YR sandbox created: %s", getattr(sandbox, "sandbox_id", "?"))
+                return cls(sandbox=sandbox)
+            except Exception as exc:
+                last_error = exc
+                sandbox_id = getattr(sandbox, "sandbox_id", None)
+                logger.critical(
+                    "Failed to create YR sandbox (sandbox_id=%s): %s",
+                    sandbox_id or "n/a", exc,
+                )
+                if sandbox is not None:
+                    try:
+                        await asyncio.to_thread(sandbox.kill)
+                    except Exception:
+                        pass
+                if retry < max_retries - 1:
+                    sleep_time = min(30, 2 ** retry)
+                    logger.info("Retrying YR sandbox creation in %d seconds...", sleep_time)
+                    await asyncio.sleep(sleep_time)
+
+        raise RuntimeError(f"Failed to create YR sandbox after {max_retries} retries") from last_error
 
     async def run(self, cmd: str, *, timeout: int = 600) -> CommandResult:
         """Execute *cmd* inside the OpenYuanRong sandbox via ``sandbox.commands.run``."""
@@ -144,12 +167,15 @@ class YRSandbox:
             return CommandResult(stdout="", stderr=str(e), exit_code=-1)
 
     async def cleanup(self) -> None:
-        """Kill the OpenYuanRong sandbox."""
+        """Kill the OpenYuanRong sandbox if still running."""
         if self._sandbox is not None:
             sandbox_id = getattr(self._sandbox, "sandbox_id", "?")
             try:
-                await asyncio.to_thread(self._sandbox.kill)
-                logger.info("YR sandbox %s killed", sandbox_id)
+                if self._sandbox.is_running():
+                    await asyncio.to_thread(self._sandbox.kill)
+                    logger.info("YR sandbox %s killed", sandbox_id)
+                else:
+                    logger.info("YR sandbox %s already stopped", sandbox_id)
             except Exception as e:
                 logger.warning("Failed to kill YR sandbox %s: %s", sandbox_id, e)
             self._sandbox = None

@@ -105,6 +105,8 @@ def build_claude_command(
         "CLAUDE_CODE_SUBAGENT_MODEL": model,
         "DISABLE_AUTOUPDATER": "1",
         "IS_SANDBOX": "1",
+        "API_TIMEOUT_MS": "600000",
+        "API_FORCE_IDLE_TIMEOUT": "0",
     }
     env_assignments = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
     if conda_env:

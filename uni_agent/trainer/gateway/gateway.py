@@ -11,12 +11,14 @@ from uuid import uuid4
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from uni_agent.trainer.framework.types import SessionHandle, Trajectory
 from uni_agent.trainer.gateway.anthropic_compat import (
     anthropic_error_body,
     anthropic_payload_to_openai,
+    anthropic_stream_events,
+    encode_anthropic_sse_event,
     openai_completion_to_anthropic_message,
 )
 from uni_agent.trainer.gateway.types import (
@@ -569,6 +571,11 @@ class _GatewayActor:
         comparison and trajectory tracking are shared with the
         ``/v1/chat/completions`` path), and results/errors are shaped into the
         Anthropic Message / error envelopes that the ``anthropic`` SDK expects.
+
+        When ``stream=True`` the response is emitted as an Anthropic Messages
+        SSE event sequence so streaming-only clients (e.g. the Claude Code
+        agent) do not fall back to a non-stream retry that would fragment the
+        trajectory.
         """
         try:
             openai_payload = anthropic_payload_to_openai(payload)
@@ -585,9 +592,16 @@ class _GatewayActor:
                 status_code=exc.status_code,
                 content=anthropic_error_body(exc.status_code, str(message)),
             )
-        return JSONResponse(
-            openai_completion_to_anthropic_message(completion, request_model=payload.get("model"))
-        )
+        anthropic_message = openai_completion_to_anthropic_message(completion, request_model=payload.get("model"))
+        if payload.get("stream"):
+            events = anthropic_stream_events(anthropic_message)
+
+            async def _sse_iter():
+                for event in events:
+                    yield encode_anthropic_sse_event(event).encode("utf-8")
+
+            return StreamingResponse(_sse_iter(), media_type="text/event-stream")
+        return JSONResponse(anthropic_message)
 
     async def _chat_completions_turn(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._sessions.get(session_id)

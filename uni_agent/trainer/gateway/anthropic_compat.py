@@ -340,6 +340,70 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]] | None:
     return converted
 
 
+_MID_SYSTEM_WRAP_PREFIX = "<system-reminder>\n"
+_MID_SYSTEM_WRAP_SUFFIX = "\n</system-reminder>\n"
+
+
+def _ensure_content_block_list(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return ``message["content"]`` as a list of Anthropic content blocks.
+
+    Promotes a plain string content to a single text block so extra blocks can
+    be appended/prepended in place.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        return content
+    message["content"] = [{"type": "text", "text": content if isinstance(content, str) else ""}]
+    return message["content"]
+
+
+def _fold_mid_list_system_into_user(raw_messages: list[dict[str, Any]]) -> None:
+    """Fold non-leading ``role: system`` messages into a neighbouring user
+    message as a ``<system-reminder>`` text block, in place.
+
+    Claude Code periodically injects a ``role: system`` message (e.g. the
+    TaskCreate/TaskUpdate reminder) into the middle of the messages list.
+    Merging it into the top-level system would grow the system prompt every
+    few turns and break the gateway's prefix check.  Following slime's
+    approach, we instead attach the wrapped reminder to the preceding user
+    message (or the next one if there is no prior user), which keeps the
+    system prompt stable and the history acceptable to chat templates.
+    """
+    system_idx = [
+        i for i, m in enumerate(raw_messages)
+        if isinstance(m, dict) and m.get("role") == "system" and i > 0
+    ]
+    if not system_idx:
+        return
+
+    tombstone: dict[str, Any] = {"__folded__": True}
+    for i in system_idx:
+        sys_msg = raw_messages[i]
+        wrapped = _MID_SYSTEM_WRAP_PREFIX + _convert_system(sys_msg.get("content")) + _MID_SYSTEM_WRAP_SUFFIX
+        wrapped_block = {"type": "text", "text": wrapped}
+
+        target: dict[str, Any] | None = None
+        for j in range(i - 1, -1, -1):
+            cand = raw_messages[j]
+            if isinstance(cand, dict) and cand.get("role") == "user":
+                target = cand
+                _ensure_content_block_list(target).append(wrapped_block)
+                break
+        if target is None:
+            for j in range(i + 1, len(raw_messages)):
+                cand = raw_messages[j]
+                if isinstance(cand, dict) and cand.get("role") == "user":
+                    target = cand
+                    _ensure_content_block_list(target).insert(0, wrapped_block)
+                    break
+        if target is None:
+            raw_messages[i] = {"role": "user", "content": [wrapped_block]}
+            continue
+        raw_messages[i] = tombstone
+
+    raw_messages[:] = [m for m in raw_messages if m is not tombstone]
+
+
 def anthropic_payload_to_openai(payload: dict[str, Any]) -> dict[str, Any]:
     """Convert an Anthropic ``/v1/messages`` request payload to the OpenAI
     Chat Completions payload shape consumed by the gateway."""
@@ -349,6 +413,8 @@ def anthropic_payload_to_openai(payload: dict[str, Any]) -> dict[str, Any]:
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise MalformedRequestError("messages must be non-empty")
+
+    _fold_mid_list_system_into_user(raw_messages)
 
     system_texts: list[str] = []
     messages: list[dict[str, Any]] = []

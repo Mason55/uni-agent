@@ -38,9 +38,10 @@ class SandboxEnvForReward:
 
     async def communicate(self, input: str, timeout=600, check="ignore", error_msg="Command failed") -> str:
         result = await self._sandbox.run(input, timeout=int(timeout))
+        output = "".join(part for part in (result.stdout, result.stderr) if part)
         if check == "raise" and result.exit_code != 0:
-            raise RuntimeError(f"{error_msg}: {result.stdout[:200]}")
-        return result.stdout
+            raise RuntimeError(f"{error_msg}: {output[:200]}")
+        return output
 
     async def write_file(self, path: str | Path, content: str) -> None:
         encoded = base64.b64encode(content.encode()).decode()

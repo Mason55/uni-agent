@@ -8,7 +8,12 @@ or SSE envelopes returned to clients.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import time
+from logging import getLogger
+from pathlib import Path
 from typing import Any
 
 import ray
@@ -86,6 +91,24 @@ class _GatewayActor:
         self._server_port: int | None = None
         self._server_task: asyncio.Task | None = None
         self._server_base_url: str | None = None
+        # DEBUG_MODE gates verbose request logging. Trajectory dumps can be
+        # enabled independently by the SWE recipe env vars, while preserving
+        # the old DEBUG_MODE behavior for existing debug runs.
+        self._debug = bool(os.environ.get("DEBUG_MODE"))
+        self._dump_trajectories = self._get_bool_env(
+            "SWE_AGENT_DUMP_TRAJECTORIES",
+            self._get_bool_env("UNI_AGENT_GATEWAY_DUMP_TRAJECTORIES", self._debug),
+        )
+        self._trajectory_dump_dir = Path(
+            os.environ.get(
+                "UNI_AGENT_GATEWAY_TRAJECTORY_DIR",
+                os.environ.get(
+                    "SWE_AGENT_TRAJECTORY_DIR",
+                    "/home/uni-agent/outputs/gateway/trajectories",
+                ),
+            )
+        )
+        self._debug_message_max_chars = self._get_int_env("UNI_AGENT_GATEWAY_DEBUG_MESSAGE_MAX_CHARS", 4000)
         self._register_routes()
 
     def _register_routes(self) -> None:
@@ -265,6 +288,7 @@ class _GatewayActor:
         """Finalize a session, remove it from the actor, and return its trajectories."""
         session = self._get_session(session_id)
         trajectories = await session.finalize()
+        self._dump_trajectories_to_disk(session_id, session, trajectories)
         self._sessions.pop(session_id, None)
         return trajectories
 
@@ -280,6 +304,105 @@ class _GatewayActor:
         """Return a snapshot of a live session's state."""
         session = self._get_session(session_id)
         return session.snapshot_state()
+
+    def _dump_trajectories_to_disk(
+        self,
+        session_id: str,
+        session: GatewaySession,
+        trajectories: list[Trajectory],
+    ) -> None:
+        """Persist finalized trajectories to disk as JSON for offline analysis.
+
+        Gated by ``SWE_AGENT_DUMP_TRAJECTORIES`` /
+        ``UNI_AGENT_GATEWAY_DUMP_TRAJECTORIES`` (or ``DEBUG_MODE`` for
+        backwards compatibility) and writes to
+        ``UNI_AGENT_GATEWAY_TRAJECTORY_DIR`` / ``SWE_AGENT_TRAJECTORY_DIR``
+        (one file per session). Heavy
+        tensor/array fields (``routed_experts``, ``multi_modal_data``) are
+        skipped to keep dumps lightweight and JSON-serializable. Gateway-visible
+        message history is included under ``gateway_debug`` because Trajectory
+        only stores token-level data.
+        """
+        if not self._dump_trajectories or not trajectories:
+            return
+        logger = getLogger("gateway")
+        try:
+            self._trajectory_dump_dir.mkdir(parents=True, exist_ok=True)
+            message_history = self._messages_for_debug(session.message_history)
+            payload = {
+                "session_id": session_id,
+                "dumped_at": time.time(),
+                "num_trajectories": len(trajectories),
+                "gateway_debug": {
+                    "session_state": session.snapshot_state(),
+                    "message_count": len(session.message_history),
+                    "roles": [message.get("role") for message in session.message_history],
+                    "message_history": message_history,
+                },
+                "trajectories": [self._trajectory_to_dict(t) for t in trajectories],
+            }
+            out_path = self._trajectory_dump_dir / f"{session_id}.json"
+            out_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(
+                "session=%s dumped %d trajectory(ies) to %s",
+                session_id,
+                len(trajectories),
+                out_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — logging must never break finalize
+            logger.warning("session=%s trajectory dump failed: %s: %s", session_id, exc.__class__.__name__, exc)
+
+    @staticmethod
+    def _trajectory_to_dict(traj: Trajectory) -> dict[str, Any]:
+        """Convert a Trajectory to a JSON-serializable dict, skipping heavy fields."""
+        return {
+            "prompt_ids": list(traj.prompt_ids),
+            "response_ids": list(traj.response_ids),
+            "response_mask": list(traj.response_mask),
+            "response_logprobs": list(traj.response_logprobs) if traj.response_logprobs else None,
+            "reward_info": dict(traj.reward_info),
+            "reward_score": traj.reward_score,
+            "num_turns": traj.num_turns,
+            "extra_fields": dict(traj.extra_fields),
+        }
+
+    @staticmethod
+    def _get_int_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _get_bool_env(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+    def _messages_for_debug(self, messages: Any) -> Any:
+        """Return a bounded JSON-safe copy of gateway-visible messages."""
+        return self._json_safe_debug_value(messages)
+
+    def _json_safe_debug_value(self, value: Any) -> Any:
+        """Convert debug payloads to JSON-safe values without mutating inputs."""
+        if isinstance(value, dict):
+            return {str(k): self._json_safe_debug_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe_debug_value(item) for item in value]
+        if isinstance(value, str):
+            if len(value) <= self._debug_message_max_chars:
+                return value
+            omitted = len(value) - self._debug_message_max_chars
+            return f"{value[: self._debug_message_max_chars]}...[truncated {omitted} chars]"
+        if isinstance(value, bytes):
+            return f"<bytes len={len(value)}>"
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return repr(value)
 
 
 GatewayActor = ray.remote(_GatewayActor)

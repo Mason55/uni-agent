@@ -461,6 +461,8 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
         "uid": "uid-0",
         "materialization_reason": "max_response_length",
     }
+    assert tag["min_global_steps"] == 7
+    assert tag["max_global_steps"] == 7
     assert "length_truncated" not in tag
     assert "traj_exit_reason" not in tag
     assert "materialization_reason" not in fields

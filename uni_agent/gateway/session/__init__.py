@@ -9,6 +9,10 @@ serves: trajectory buffering and message encoding/decoding.
 from typing import Any
 
 __all__ = [
+    "CapturedGeneration",
+    "CaptureReceipt",
+    "CaptureTransaction",
+    "CaptureUsage",
     "InternalGenerationRequest",
     "GatewaySession",
     "MessageCodec",
@@ -40,10 +44,30 @@ def __getattr__(name: str) -> Any:
             "TrajectoryBuffer": TrajectoryBuffer,
             "TrajectorySession": TrajectorySession,
         }[name]
-    if name in {"InternalGenerationRequest", "SessionHandle", "Trajectory"}:
-        from .types import InternalGenerationRequest, SessionHandle, Trajectory
+    if name in {
+        "CapturedGeneration",
+        "CaptureReceipt",
+        "CaptureTransaction",
+        "CaptureUsage",
+        "InternalGenerationRequest",
+        "SessionHandle",
+        "Trajectory",
+    }:
+        from .types import (
+            CapturedGeneration,
+            CaptureReceipt,
+            CaptureTransaction,
+            CaptureUsage,
+            InternalGenerationRequest,
+            SessionHandle,
+            Trajectory,
+        )
 
         return {
+            "CapturedGeneration": CapturedGeneration,
+            "CaptureReceipt": CaptureReceipt,
+            "CaptureTransaction": CaptureTransaction,
+            "CaptureUsage": CaptureUsage,
             "InternalGenerationRequest": InternalGenerationRequest,
             "SessionHandle": SessionHandle,
             "Trajectory": Trajectory,

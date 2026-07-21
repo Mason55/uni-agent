@@ -3,12 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from uni_agent.gateway.session.types import SessionHandle, Trajectory
+from uni_agent.gateway.session.types import (
+    CapturedGeneration,
+    CaptureReceipt,
+    CaptureTransaction,
+    CaptureUsage,
+    InternalGenerationRequest,
+    SessionHandle,
+    Trajectory,
+    mutable_capture_mapping,
+    mutable_capture_value,
+    normalize_finish_reason,
+)
+
+if TYPE_CHECKING:
+    from uni_agent.gateway.session.codec import MessageCodec
+
+_EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
 
 
 class SessionPhase(str, Enum):
@@ -60,6 +79,60 @@ class MaterializedChain:
     order_seq: int
 
 
+@dataclass
+class _PreparedSingleTurnCapture:
+    """Session-private state retained between capture preparation and commit."""
+
+    context_ids: tuple[int, ...]
+    sampling_params: dict[str, Any]
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None
+    image_data: list[Any] | None
+    video_data: list[Any] | None
+
+
+class _CaptureTransaction:
+    """Opaque asynchronous transaction for one externally-owned model call."""
+
+    def __init__(self, session: TrajectorySession, prepared: _PreparedSingleTurnCapture):
+        self._session = session
+        self._prepared = prepared
+        self._commit_lock = asyncio.Lock()
+        self._receipt: CaptureReceipt | None = None
+
+    @property
+    def context_ids(self) -> tuple[int, ...]:
+        """Return the token IDs prepared for upstream inference."""
+        return self._prepared.context_ids
+
+    @property
+    def sampling_params(self) -> dict[str, Any]:
+        """Return a copy of the merged sampling parameters."""
+        return deepcopy(self._prepared.sampling_params)
+
+    @property
+    def image_data(self) -> tuple[Any, ...] | None:
+        """Return optional image inputs prepared for upstream inference."""
+        if self._prepared.image_data is None:
+            return None
+        return tuple(self._prepared.image_data)
+
+    @property
+    def video_data(self) -> tuple[Any, ...] | None:
+        """Return optional video inputs prepared for upstream inference."""
+        if self._prepared.video_data is None:
+            return None
+        return tuple(self._prepared.video_data)
+
+    async def commit(self, generation: CapturedGeneration) -> CaptureReceipt:
+        """Commit externally-produced rollout truth and return its receipt."""
+        async with self._commit_lock:
+            if self._receipt is not None:
+                raise RuntimeError("capture transaction is already committed")
+            self._receipt = await self._session._commit_single_turn_capture(self._prepared, generation)
+            return self._receipt
+
+
 class TrajectorySession:
     """Own trajectory state and lifecycle without inference or transport.
 
@@ -68,9 +141,21 @@ class TrajectorySession:
     reusing this single state owner.
     """
 
-    def __init__(self, handle: SessionHandle):
+    def __init__(
+        self,
+        handle: SessionHandle,
+        codec: MessageCodec | None = None,
+        *,
+        response_length: int | None = None,
+        sampling_params: dict[str, Any] | None = None,
+    ):
         """Create an empty active trajectory session."""
+        if response_length is not None and response_length <= 0:
+            raise ValueError(f"response_length must be positive when set, got {response_length}")
         self.handle = handle
+        self._codec = codec
+        self._response_length = response_length
+        self._sampling_params = deepcopy(sampling_params or {})
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
         self.reserved_chain_ids: set[int] = set()
@@ -81,6 +166,98 @@ class TrajectorySession:
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.request_lock = asyncio.Lock()
+
+    async def capture(self, request: InternalGenerationRequest) -> CaptureTransaction:
+        """Prepare an initial passive-capture transaction for external rollout."""
+        async with self.request_lock:
+            if self.phase != SessionPhase.ACTIVE:
+                raise SessionLifecycleError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
+            if self._codec is None:
+                raise RuntimeError("TrajectorySession.capture requires a message codec")
+            if self.active_chains:
+                raise RuntimeError("single-turn passive capture does not support continuation")
+
+            messages = deepcopy(request["messages"])
+            tools = deepcopy(request["tools"])
+            image_data, video_data = await self._codec.extract_multi_modal_data(messages)
+            context_ids = tuple(
+                self._codec.encode_full(
+                    messages,
+                    tools=tools,
+                    image_data=image_data,
+                    video_data=video_data,
+                )
+            )
+            merged_sampling_params = deepcopy(self._sampling_params)
+            merged_sampling_params.update(deepcopy(request["sampling_params"]))
+            if self._response_length is not None:
+                merged_sampling_params["max_tokens"] = min(
+                    merged_sampling_params.get("max_tokens", self._response_length),
+                    self._response_length,
+                )
+            prepared = _PreparedSingleTurnCapture(
+                context_ids=context_ids,
+                sampling_params=merged_sampling_params,
+                messages=messages,
+                tools=tools,
+                image_data=self._copy_media_list(image_data),
+                video_data=self._copy_media_list(video_data),
+            )
+            return _CaptureTransaction(self, prepared)
+
+    async def _commit_single_turn_capture(
+        self,
+        prepared: _PreparedSingleTurnCapture,
+        generation: CapturedGeneration,
+    ) -> CaptureReceipt:
+        async with self.request_lock:
+            if self.phase != SessionPhase.ACTIVE:
+                raise SessionLifecycleError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
+            if self.active_chains:
+                raise RuntimeError("single-turn passive capture does not support continuation")
+
+            assistant_message = mutable_capture_mapping(generation.assistant_message)
+            message_history = [*prepared.messages, assistant_message]
+            message_prefix_hashes = self._extend_message_prefix_hashes([], message_history)
+            chain_id = self._allocate_chain_id()
+            order_seq = self._next_order_seq()
+            response_ids = tuple(generation.completion_ids)
+            response_logprobs = tuple(generation.completion_logprobs)
+            self.active_chains.append(
+                ChainState(
+                    chain_id=chain_id,
+                    message_history=message_history,
+                    message_tip_hash=message_prefix_hashes[-1],
+                    active_tool_schemas=prepared.tools,
+                    buffer=TrajectoryBuffer(
+                        prompt_ids=list(generation.prompt_ids),
+                        response_ids=list(response_ids),
+                        response_mask=[1] * len(response_ids),
+                        response_logprobs=list(response_logprobs),
+                        routed_experts=mutable_capture_value(generation.routed_experts),
+                    ),
+                    image_data=self._copy_media_list(prepared.image_data),
+                    video_data=self._copy_media_list(prepared.video_data),
+                    updated_seq=order_seq,
+                )
+            )
+            self._touch()
+            return CaptureReceipt(
+                prompt_ids=tuple(generation.prompt_ids),
+                response_ids=response_ids,
+                response_mask=(1,) * len(response_ids),
+                response_logprobs=response_logprobs,
+                chain_id=chain_id,
+                turn_id=1,
+                usage=CaptureUsage(
+                    prompt_tokens=len(generation.prompt_ids),
+                    completion_tokens=len(response_ids),
+                ),
+                assistant_message=assistant_message,
+                finish_reason=normalize_finish_reason(generation.stop_reason),
+                routed_experts=generation.routed_experts,
+                routing_metadata=generation.routing_metadata,
+            )
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
         """Store session-level reward metadata without closing the session."""
@@ -151,6 +328,34 @@ class TrajectorySession:
     def _copy_media_list(self, media: list[Any] | None) -> list[Any] | None:
         # Copy only the container; media payloads may not be deepcopyable.
         return list(media) if media is not None else None
+
+    def _extend_message_prefix_hashes(
+        self,
+        existing_prefix_hashes: list[str],
+        new_messages: list[dict[str, Any]],
+    ) -> list[str]:
+        prefix_hashes = list(existing_prefix_hashes)
+        previous_prefix_hash = prefix_hashes[-1] if prefix_hashes else _EMPTY_PREFIX_HASH
+        for message in new_messages:
+            message_hash = self._compute_message_hash(message)
+            prefix_hash = hashlib.sha256(
+                b"uni-agent-prefix-v1\0" + previous_prefix_hash.encode("ascii") + b"\0" + message_hash.encode("ascii")
+            ).hexdigest()
+            prefix_hashes.append(prefix_hash)
+            previous_prefix_hash = prefix_hash
+        return prefix_hashes
+
+    def _compute_message_hash(self, message: dict[str, Any]) -> str:
+        if self._codec is None:
+            raise RuntimeError("message hashing requires a message codec")
+        canonical = self._codec.canonicalize_message_for_prefix_comparison(message)
+        canonical_json = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(b"uni-agent-message-v1\0" + canonical_json).hexdigest()
 
     def _find_active_chain(self, chain_id: int) -> tuple[int, ChainState]:
         for index, chain in enumerate(self.active_chains):

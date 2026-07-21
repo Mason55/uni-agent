@@ -12,23 +12,12 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+from uni_agent.gateway.session.types import normalize_finish_reason
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
 from verl.utils.tokenizer.chat_template import initialize_system_prompt
 
 logger = logging.getLogger("gateway")
-
-# Map backend stop_reason values into the gateway's internal finish_reason vocabulary.
-_FINISH_REASON_MAP = {
-    "completed": "stop",
-    "stop": "stop",
-    "matched_stop": "stop",
-    "eos": "stop",
-    "length": "length",
-    "max_tokens": "length",
-    "aborted": "stop",
-    "abort": "stop",
-}
 
 _SGLANG_TOOL_PARSER_ALIASES = {
     "qwen3_xml": "qwen3_coder",
@@ -310,7 +299,7 @@ class MessageCodec:
                 }
                 return message, "tool_calls"
         response_text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-        finish_reason = _FINISH_REASON_MAP.get(stop_reason, stop_reason) if stop_reason else "stop"
+        finish_reason = normalize_finish_reason(stop_reason)
         return {"role": "assistant", "content": response_text}, finish_reason
 
     def canonicalize_message_for_prefix_comparison(self, message: dict[str, Any]) -> dict[str, Any]:

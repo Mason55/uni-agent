@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,8 +17,6 @@ from uni_agent.gateway.session.trajectory_session import (
     TrajectorySession,
 )
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
-
-_EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
 
 
 @dataclass
@@ -100,10 +96,12 @@ class GatewaySession:
         sampling_params: dict[str, Any] | None = None,
     ):
         """Create an active session bound to a handle and model codec."""
-        if response_length is not None and response_length <= 0:
-            raise ValueError(f"response_length must be positive when set, got {response_length}")
-
-        self._trajectory_session = TrajectorySession(handle)
+        self._trajectory_session = TrajectorySession(
+            handle,
+            codec,
+            response_length=response_length,
+            sampling_params=sampling_params,
+        )
         self._codec = codec
         # Provider adapters merge these trusted defaults before calling the
         # session; the response budget is enforced here during preparation.
@@ -413,26 +411,7 @@ class GatewaySession:
         existing_prefix_hashes: list[str],
         new_messages: list[dict[str, Any]],
     ) -> list[str]:
-        prefix_hashes = list(existing_prefix_hashes)
-        previous_prefix_hash = prefix_hashes[-1] if prefix_hashes else _EMPTY_PREFIX_HASH
-        for message in new_messages:
-            message_hash = self._compute_message_hash(message)
-            prefix_hash = hashlib.sha256(
-                b"uni-agent-prefix-v1\0" + previous_prefix_hash.encode("ascii") + b"\0" + message_hash.encode("ascii")
-            ).hexdigest()
-            prefix_hashes.append(prefix_hash)
-            previous_prefix_hash = prefix_hash
-        return prefix_hashes
-
-    def _compute_message_hash(self, message: dict[str, Any]) -> str:
-        canonical = self._codec.canonicalize_message_for_prefix_comparison(message)
-        canonical_json = json.dumps(
-            canonical,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return hashlib.sha256(b"uni-agent-message-v1\0" + canonical_json).hexdigest()
+        return self._trajectory_session._extend_message_prefix_hashes(existing_prefix_hashes, new_messages)
 
     def _copy_trajectory_buffer(self, buffer: TrajectoryBuffer) -> TrajectoryBuffer:
         return self._trajectory_session._copy_trajectory_buffer(buffer)

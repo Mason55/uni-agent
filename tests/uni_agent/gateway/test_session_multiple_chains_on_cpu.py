@@ -80,6 +80,21 @@ class _LogprobBackend:
         return TokenOutput(token_ids=token_ids, log_probs=log_probs, stop_reason="completed")
 
 
+class _RoutedExpertsBackend:
+    def __init__(self, steps):
+        self.steps = list(steps)
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+        text, routed_experts = self.steps.pop(0)
+        token_ids = _ids(text)
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=None,
+            routed_experts=routed_experts,
+            stop_reason="completed",
+        )
+
+
 class _ControlledParallelBackend:
     def __init__(self, steps):
         self.steps = list(steps)
@@ -170,6 +185,32 @@ async def test_multiple_chains_linear_conversation_stays_single_chain():
     assert 0 in chain_trajectories[0].response_mask
     assert chain_trajectories[0].response_mask[-len("SECOND") :] == [1] * len("SECOND")
     assert chain_trajectories[0].reward_info == {"label": "linear"}
+
+
+@pytest.mark.asyncio
+async def test_multiple_chains_preserve_latest_full_context_routed_experts():
+    """Replace continuation routing and preserve it in the finalized trajectory."""
+    session = _session("routed-experts")
+    backend = _RoutedExpertsBackend(
+        [
+            ("FIRST", [[1], [2]]),
+            ("SECOND", [[3], [4], [5]]),
+        ]
+    )
+    first_messages = [{"role": "user", "content": "first turn"}]
+    second_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "FIRST"},
+        {"role": "user", "content": "follow up"},
+    ]
+
+    await _run(session, backend, first_messages)
+    await _run(session, backend, second_messages)
+
+    trajectories = await session.finalize()
+
+    assert len(trajectories) == 1
+    assert trajectories[0].routed_experts == [[3], [4], [5]]
 
 
 @pytest.mark.asyncio

@@ -5,77 +5,22 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import time
-from dataclasses import dataclass, field, replace
-from enum import Enum
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
+from uni_agent.gateway.session.trajectory_session import (
+    ChainState,
+    MaterializedChain,
+    SessionPhase,
+    TrajectoryBuffer,
+    TrajectorySession,
+)
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
-
-
-class SessionPhase(str, Enum):
-    """Lifecycle state for a gateway session.
-
-    Attributes:
-        ACTIVE: The session can accept generation and reward-info requests.
-        FINALIZED: Final trajectories were returned and the session is closed.
-        ABORTED: The session was cancelled and should not produce trajectories.
-    """
-
-    ACTIVE = "ACTIVE"
-    FINALIZED = "FINALIZED"
-    ABORTED = "ABORTED"
-
-
-@dataclass
-class TrajectoryBuffer:
-    """Mutable token buffer for the active trajectory under construction.
-
-    Attributes:
-        prompt_ids: Prompt token IDs for the current trajectory.
-        response_ids: Accumulated response-side token IDs.
-        response_mask: Labels aligned with ``response_ids``; ``1`` for model
-            output and ``0`` for continuation context tokens.
-        response_logprobs: Log probabilities aligned with ``response_ids`` when
-            present; continuation context tokens use ``0.0``.
-        routed_experts: Latest per-token expert-routing tensor from the backend,
-            spanning ``prompt + response``. The backend re-prefills the full
-            context each turn, so this is replaced (not accumulated) and the final
-            value covers the whole sequence (mirrors verl's tool_agent_loop).
-    """
-
-    prompt_ids: list[int]
-    response_ids: list[int] = field(default_factory=list)
-    response_mask: list[int] = field(default_factory=list)
-    response_logprobs: list[float] = field(default_factory=list)
-    routed_experts: Any | None = None
-
-
-@dataclass
-class ChainState:
-    """One active linear trajectory chain in a gateway session."""
-
-    chain_id: int
-    message_history: list[dict[str, Any]]
-    message_tip_hash: str
-    active_tool_schemas: list[dict[str, Any]] | None
-    buffer: TrajectoryBuffer
-    image_data: list[Any] | None
-    video_data: list[Any] | None
-    updated_seq: int
-
-
-@dataclass
-class MaterializedChain:
-    """A closed chain plus the ordering metadata needed at finalize."""
-
-    trajectory: Trajectory
-    order_seq: int
 
 
 @dataclass
@@ -158,28 +103,63 @@ class GatewaySession:
         if response_length is not None and response_length <= 0:
             raise ValueError(f"response_length must be positive when set, got {response_length}")
 
-        self.handle = handle
+        self._trajectory_session = TrajectorySession(handle)
         self._codec = codec
         # Provider adapters merge these trusted defaults before calling the
         # session; the response budget is enforced here during preparation.
         self._prompt_length = prompt_length
         self._response_length = response_length
         self._sampling_params = dict(sampling_params or {})
-        self.active_chains: list[ChainState] = []
-        self.materialized_chains: list[MaterializedChain] = []
-        self.reserved_chain_ids: set[int] = set()
-        self._next_chain_id = 1
-        self._order_seq = 0
-        self.reward_info: dict[str, Any] = {}
-        self.phase = SessionPhase.ACTIVE
-        self.created_at = time.time()
-        self.updated_at = self.created_at
-        self.request_lock = asyncio.Lock()
 
     @property
     def sampling_params(self) -> dict[str, Any]:
         """Return a copy of the trusted per-session sampling defaults."""
         return dict(self._sampling_params)
+
+    @property
+    def handle(self) -> SessionHandle:
+        """Return the handle owned by the trajectory session."""
+        return self._trajectory_session.handle
+
+    @property
+    def active_chains(self) -> list[ChainState]:
+        """Expose active chains for backwards-compatible diagnostics."""
+        return self._trajectory_session.active_chains
+
+    @property
+    def materialized_chains(self) -> list[MaterializedChain]:
+        """Expose materialized chains for backwards-compatible diagnostics."""
+        return self._trajectory_session.materialized_chains
+
+    @property
+    def reserved_chain_ids(self) -> set[int]:
+        """Expose reservations to the legacy rollout implementation."""
+        return self._trajectory_session.reserved_chain_ids
+
+    @property
+    def reward_info(self) -> dict[str, Any]:
+        """Expose reward metadata for backwards compatibility."""
+        return self._trajectory_session.reward_info
+
+    @property
+    def phase(self) -> SessionPhase:
+        """Return the trajectory-session lifecycle phase."""
+        return self._trajectory_session.phase
+
+    @property
+    def created_at(self) -> float:
+        """Return the trajectory-session creation time."""
+        return self._trajectory_session.created_at
+
+    @property
+    def updated_at(self) -> float:
+        """Return the trajectory-session last-update time."""
+        return self._trajectory_session.updated_at
+
+    @property
+    def request_lock(self) -> asyncio.Lock:
+        """Return the lock shared by rollout and trajectory lifecycle work."""
+        return self._trajectory_session.request_lock
 
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Run one provider-normalized generation request and return its business outcome.
@@ -284,58 +264,20 @@ class GatewaySession:
                 await asyncio.shield(self._release_chain_reservation(reserved_chain_id))
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
-        """Store session-level reward metadata without closing the session."""
-        async with self.request_lock:
-            if self.phase != SessionPhase.ACTIVE:
-                raise RuntimeError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
-            if reward_info is not None:
-                self.reward_info = dict(reward_info)
-            self._touch()
+        """Delegate reward metadata to the trajectory state owner."""
+        await self._trajectory_session.set_reward_info(reward_info)
 
     async def finalize(self) -> list[Trajectory]:
-        """Close the session and return its materialized trajectories with rewards."""
-        async with self.request_lock:
-            if self.phase == SessionPhase.ABORTED:
-                raise RuntimeError(f"Session {self.handle.session_id} is aborted")
-            if self.phase == SessionPhase.FINALIZED:
-                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
-            self._touch()
-            self._materialize_active_chains()
-            self.reserved_chain_ids.clear()
-            self.phase = SessionPhase.FINALIZED
-            self._touch()
-            ordered_trajectories = [
-                materialized.trajectory
-                for materialized in sorted(self.materialized_chains, key=lambda chain: chain.order_seq)
-            ]
-            return [replace(trajectory, reward_info=dict(self.reward_info)) for trajectory in ordered_trajectories]
+        """Delegate finalization to the trajectory state owner."""
+        return await self._trajectory_session.finalize()
 
     async def abort(self) -> None:
-        """Abort the session and prevent further generation."""
-        async with self.request_lock:
-            if self.phase == SessionPhase.ABORTED:
-                return
-            if self.phase == SessionPhase.FINALIZED:
-                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
-            self.phase = SessionPhase.ABORTED
-            self.active_chains = []
-            self.materialized_chains = []
-            self.reserved_chain_ids.clear()
-            self._touch()
+        """Delegate abort to the trajectory state owner."""
+        await self._trajectory_session.abort()
 
     def snapshot_state(self) -> dict[str, Any]:
-        """Return a JSON-serializable snapshot for actor state inspection."""
-        return {
-            "session_id": self.handle.session_id,
-            "phase": self.phase.value,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "num_trajectories": len(self.materialized_chains),
-            "has_active_trajectory": bool(self.active_chains),
-            "num_active_chains": len(self.active_chains),
-            "active_chain_ids": [chain.chain_id for chain in self.active_chains],
-            "active_chain_tip_hashes": {chain.chain_id: chain.message_tip_hash for chain in self.active_chains},
-        }
+        """Delegate state inspection to the trajectory state owner."""
+        return self._trajectory_session.snapshot_state()
 
     async def _prepare_generation_inputs(
         self,
@@ -493,23 +435,13 @@ class GatewaySession:
         return hashlib.sha256(b"uni-agent-message-v1\0" + canonical_json).hexdigest()
 
     def _copy_trajectory_buffer(self, buffer: TrajectoryBuffer) -> TrajectoryBuffer:
-        return TrajectoryBuffer(
-            prompt_ids=list(buffer.prompt_ids),
-            response_ids=list(buffer.response_ids),
-            response_mask=list(buffer.response_mask),
-            response_logprobs=list(buffer.response_logprobs),
-            routed_experts=buffer.routed_experts,
-        )
+        return self._trajectory_session._copy_trajectory_buffer(buffer)
 
     def _copy_chain_media(self, chain: ChainState) -> tuple[list[Any] | None, list[Any] | None]:
-        return (
-            self._copy_media_list(chain.image_data),
-            self._copy_media_list(chain.video_data),
-        )
+        return self._trajectory_session._copy_chain_media(chain)
 
     def _copy_media_list(self, media: list[Any] | None) -> list[Any] | None:
-        # Copy only the container; media payloads may not be deepcopyable.
-        return list(media) if media is not None else None
+        return self._trajectory_session._copy_media_list(media)
 
     def _commit_generation_to_chain(self, encoded: EncodedData, assistant_msg: dict[str, Any]) -> None:
         message_history = list(encoded.messages) + [assistant_msg]
@@ -562,33 +494,16 @@ class GatewaySession:
         del self.active_chains[chain_index]
 
     def _find_active_chain(self, chain_id: int) -> tuple[int, ChainState]:
-        for index, chain in enumerate(self.active_chains):
-            if chain.chain_id == chain_id:
-                return index, chain
-        raise RuntimeError(f"active chain {chain_id} not found")
+        return self._trajectory_session._find_active_chain(chain_id)
 
     def _allocate_chain_id(self) -> int:
-        chain_id = self._next_chain_id
-        self._next_chain_id += 1
-        return chain_id
+        return self._trajectory_session._allocate_chain_id()
 
     async def _release_chain_reservation(self, chain_id: int) -> None:
-        async with self.request_lock:
-            self.reserved_chain_ids.discard(chain_id)
+        await self._trajectory_session._release_chain_reservation(chain_id)
 
     def _next_order_seq(self) -> int:
-        self._order_seq += 1
-        return self._order_seq
-
-    def _materialize_active_chains(self) -> None:
-        for chain in self.active_chains:
-            self.materialized_chains.append(
-                MaterializedChain(
-                    trajectory=self._build_materialized_trajectory(chain=chain),
-                    order_seq=chain.updated_seq,
-                )
-            )
-        self.active_chains = []
+        return self._trajectory_session._next_order_seq()
 
     def _build_materialized_trajectory(
         self,
@@ -596,38 +511,10 @@ class GatewaySession:
         chain: ChainState,
         extra_fields: dict[str, Any] | None = None,
     ) -> Trajectory:
-        response_logprobs = None
-        if chain.buffer.response_logprobs and len(chain.buffer.response_logprobs) == len(chain.buffer.response_ids):
-            response_logprobs = list(chain.buffer.response_logprobs)
-        return Trajectory(
-            prompt_ids=list(chain.buffer.prompt_ids),
-            response_ids=list(chain.buffer.response_ids),
-            response_mask=list(chain.buffer.response_mask),
-            response_logprobs=response_logprobs,
-            reward_info={},
-            num_turns=self._count_chat_turns(chain.message_history),
-            routed_experts=chain.buffer.routed_experts,
-            multi_modal_data=self._build_multi_modal_trajectory_data(
-                chain.image_data,
-                chain.video_data,
-            ),
-            extra_fields=dict(extra_fields) if extra_fields else {},
+        return self._trajectory_session._build_materialized_trajectory(
+            chain=chain,
+            extra_fields=extra_fields,
         )
 
-    def _count_chat_turns(self, message_history: list[dict[str, Any]]) -> int:
-        return sum(1 for m in message_history if m.get("role") in ("user", "assistant")) + 1
-
-    def _build_multi_modal_trajectory_data(
-        self,
-        image_data: list[Any] | None,
-        video_data: list[Any] | None,
-    ) -> dict[str, Any] | None:
-        multi_modal_data: dict[str, Any] = {}
-        if image_data:
-            multi_modal_data["images"] = list(image_data)
-        if video_data:
-            multi_modal_data["videos"] = list(video_data)
-        return multi_modal_data or None
-
     def _touch(self) -> None:
-        self.updated_at = time.time()
+        self._trajectory_session._touch()

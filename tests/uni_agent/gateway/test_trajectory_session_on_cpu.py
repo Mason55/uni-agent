@@ -231,3 +231,310 @@ def test_capture_records_are_immutable():
         generation.routing_metadata["route"]["adapter"] = "changed"
     with pytest.raises(TypeError):
         generation.routed_experts["layers"][0][0] = 9
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_linear_continuation_accumulates_context_and_model_tokens():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-continuation"),
+        MessageCodec(FakeTokenizer()),
+        sampling_params={"logprobs": True},
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first_transaction = await session.capture(
+        {"messages": first_messages, "tools": None, "sampling_params": {}}
+    )
+    first_receipt = await first_transaction.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first_transaction.context_ids,
+            completion_ids=(79, 78, 69),
+            completion_logprobs=(-0.1, -0.2, -0.3),
+            stop_reason="completed",
+            routed_experts={"turn": 1},
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+
+    continuation = await session.capture(
+        {"messages": continuation_messages, "tools": None, "sampling_params": {}}
+    )
+
+    incremental_ids = tuple(ord(char) for char in "user:next\nassistant:")
+    assert continuation.context_ids == (
+        *first_receipt.prompt_ids,
+        *first_receipt.response_ids,
+        *incremental_ids,
+    )
+    second_receipt = await continuation.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "TWO"},
+            prompt_ids=continuation.context_ids,
+            completion_ids=(84, 87, 79),
+            completion_logprobs=(-0.4, -0.5, -0.6),
+            stop_reason="completed",
+            routed_experts={"turn": 2},
+        )
+    )
+
+    assert second_receipt.chain_id == first_receipt.chain_id
+    assert second_receipt.turn_id == 2
+    assert second_receipt.prompt_ids == continuation.context_ids
+    assert second_receipt.response_ids == (84, 87, 79)
+    assert second_receipt.response_mask == (1, 1, 1)
+    assert second_receipt.response_logprobs == (-0.4, -0.5, -0.6)
+    assert second_receipt.routed_experts == {"turn": 2}
+
+    [trajectory] = await session.finalize()
+    assert trajectory.response_ids == [*first_receipt.response_ids, *incremental_ids, *second_receipt.response_ids]
+    assert trajectory.response_mask == [1, 1, 1, *([0] * len(incremental_ids)), 1, 1, 1]
+    assert trajectory.response_logprobs == [
+        -0.1,
+        -0.2,
+        -0.3,
+        *([0.0] * len(incremental_ids)),
+        -0.4,
+        -0.5,
+        -0.6,
+    ]
+    assert trajectory.routed_experts == {"turn": 2}
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_zero_token_turn_keeps_continuation_logprobs_aligned():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-zero-token-logprobs"),
+        MessageCodec(FakeTokenizer()),
+        sampling_params={"logprobs": True},
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": ""},
+            prompt_ids=first.context_ids,
+            completion_ids=(),
+            completion_logprobs=(),
+            stop_reason="length",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "next"},
+    ]
+    continuation = await session.capture(
+        {"messages": continuation_messages, "tools": None, "sampling_params": {}}
+    )
+    await continuation.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "X"},
+            prompt_ids=continuation.context_ids,
+            completion_ids=(88,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+
+    [trajectory] = await session.finalize()
+    assert trajectory.response_logprobs is not None
+    assert len(trajectory.response_logprobs) == len(trajectory.response_ids)
+    assert trajectory.response_logprobs[:-1] == [0.0] * (len(trajectory.response_ids) - 1)
+    assert trajectory.response_logprobs[-1] == -0.1
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_tool_continuation_reuses_chain_and_preserves_tools():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-tool-continuation"),
+        MessageCodec(FakeTokenizer()),
+    )
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    tool_call = {
+        "id": "call_fixture",
+        "type": "function",
+        "function": {"name": "search", "arguments": '{"query":"weather"}'},
+    }
+    first_messages = [{"role": "user", "content": "weather"}]
+    first = await session.capture({"messages": first_messages, "tools": tools, "sampling_params": {}})
+    first_receipt = await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "", "tool_calls": [tool_call]},
+            prompt_ids=first.context_ids,
+            completion_ids=(84,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+        {"role": "tool", "tool_call_id": "call_fixture", "content": "sunny"},
+    ]
+
+    continuation = await session.capture(
+        {"messages": continuation_messages, "tools": tools, "sampling_params": {}}
+    )
+    second_receipt = await continuation.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "Sunny."},
+            prompt_ids=continuation.context_ids,
+            completion_ids=(83,),
+            completion_logprobs=(-0.2,),
+            stop_reason="completed",
+        )
+    )
+
+    assert second_receipt.chain_id == first_receipt.chain_id
+    assert second_receipt.turn_id == 2
+    [trajectory] = await session.finalize()
+    assert trajectory.response_ids[0] == 84
+    assert trajectory.response_ids[-1] == 83
+    assert 0 in trajectory.response_mask
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_multimodal_continuation_accumulates_new_media():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-multimodal-continuation"),
+        MessageCodec(
+            FakeTokenizer(),
+            processor=FakeProcessor(),
+            vision_info_extractor=_video_metadata_extractor,
+        ),
+    )
+    first_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "image://first"}},
+                {"type": "text", "text": "inspect"},
+            ],
+        }
+    ]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "seen"},
+            prompt_ids=first.context_ids,
+            completion_ids=(65,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "seen"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": "video://second"}},
+                {"type": "text", "text": "compare"},
+            ],
+        },
+    ]
+
+    continuation = await session.capture(
+        {"messages": continuation_messages, "tools": None, "sampling_params": {}}
+    )
+
+    assert continuation.image_data == ("image://first",)
+    assert continuation.video_data == (("video://second", {"url": "video://second"}),)
+    await continuation.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "compared"},
+            prompt_ids=continuation.context_ids,
+            completion_ids=(66,),
+            completion_logprobs=(-0.2,),
+            stop_reason="completed",
+        )
+    )
+    [trajectory] = await session.finalize()
+    assert trajectory.multi_modal_data == {
+        "images": ["image://first"],
+        "videos": [("video://second", {"url": "video://second"})],
+    }
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_response_budget_clamps_then_closes_exhausted_chain():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-length-exhaustion"),
+        MessageCodec(FakeTokenizer()),
+        response_length=24,
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture(
+        {
+            "messages": first_messages,
+            "tools": None,
+            "sampling_params": {"max_tokens": 99},
+        }
+    )
+    assert first.sampling_params["max_tokens"] == 24
+    first_receipt = await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first.context_ids,
+            completion_ids=(79, 78, 69),
+            completion_logprobs=(-0.1, -0.2, -0.3),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+
+    clamped = await session.capture(
+        {"messages": continuation_messages, "tools": None, "sampling_params": {"max_tokens": 99}}
+    )
+    assert clamped.length_exhausted is False
+    assert clamped.sampling_params["max_tokens"] == 1
+    second_receipt = await clamped.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "X"},
+            prompt_ids=clamped.context_ids,
+            completion_ids=(88,),
+            completion_logprobs=(-0.4,),
+            stop_reason="length",
+        )
+    )
+    exhausted_messages = [
+        *continuation_messages,
+        {"role": "assistant", "content": "X"},
+        {"role": "user", "content": "again"},
+    ]
+
+    exhausted = await session.capture(
+        {"messages": exhausted_messages, "tools": None, "sampling_params": {"max_tokens": 99}}
+    )
+
+    assert exhausted.length_exhausted is True
+    assert exhausted.sampling_params == {}
+    receipt = await exhausted.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ignored"},
+            prompt_ids=exhausted.context_ids,
+            completion_ids=(),
+            completion_logprobs=(),
+            stop_reason="length",
+        )
+    )
+    assert receipt.chain_id == first_receipt.chain_id
+    assert receipt.turn_id == 3
+    assert receipt.response_ids == ()
+    assert receipt.response_mask == ()
+    assert receipt.response_logprobs == ()
+    assert receipt.finish_reason == "length"
+    assert receipt.assistant_message == {"role": "assistant", "content": ""}
+
+    [trajectory] = await session.finalize()
+    assert trajectory.response_ids[-1] == second_receipt.response_ids[-1]
+    assert trajectory.response_mask.count(1) == 4
+    assert trajectory.extra_fields == {"materialization_reason": "max_response_length"}

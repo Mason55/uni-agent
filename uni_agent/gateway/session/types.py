@@ -145,6 +145,9 @@ class CaptureTransaction(Protocol):
     @property
     def video_data(self) -> tuple[Any, ...] | None: ...
 
+    @property
+    def length_exhausted(self) -> bool: ...
+
     async def commit(self, generation: CapturedGeneration) -> CaptureReceipt: ...
 
 

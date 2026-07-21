@@ -80,21 +80,26 @@ class MaterializedChain:
 
 
 @dataclass
-class _PreparedSingleTurnCapture:
+class _PreparedCapture:
     """Session-private state retained between capture preparation and commit."""
 
+    buffer: TrajectoryBuffer
     context_ids: tuple[int, ...]
     sampling_params: dict[str, Any]
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] | None
     image_data: list[Any] | None
     video_data: list[Any] | None
+    chain_id: int | None
+    turn_id: int
+    incoming_message_prefix_hashes: list[str]
+    length_exhausted_trajectory: Trajectory | None = None
 
 
 class _CaptureTransaction:
     """Opaque asynchronous transaction for one externally-owned model call."""
 
-    def __init__(self, session: TrajectorySession, prepared: _PreparedSingleTurnCapture):
+    def __init__(self, session: TrajectorySession, prepared: _PreparedCapture):
         self._session = session
         self._prepared = prepared
         self._commit_lock = asyncio.Lock()
@@ -124,12 +129,17 @@ class _CaptureTransaction:
             return None
         return tuple(self._prepared.video_data)
 
+    @property
+    def length_exhausted(self) -> bool:
+        """Return whether the session budget forbids another model token."""
+        return self._prepared.length_exhausted_trajectory is not None
+
     async def commit(self, generation: CapturedGeneration) -> CaptureReceipt:
         """Commit externally-produced rollout truth and return its receipt."""
         async with self._commit_lock:
             if self._receipt is not None:
                 raise RuntimeError("capture transaction is already committed")
-            self._receipt = await self._session._commit_single_turn_capture(self._prepared, generation)
+            self._receipt = await self._session._commit_capture(self._prepared, generation)
             return self._receipt
 
 
@@ -168,79 +178,184 @@ class TrajectorySession:
         self.request_lock = asyncio.Lock()
 
     async def capture(self, request: InternalGenerationRequest) -> CaptureTransaction:
-        """Prepare an initial passive-capture transaction for external rollout."""
+        """Prepare a passive-capture transaction for external rollout."""
         async with self.request_lock:
             if self.phase != SessionPhase.ACTIVE:
                 raise SessionLifecycleError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
             if self._codec is None:
                 raise RuntimeError("TrajectorySession.capture requires a message codec")
-            if self.active_chains:
-                raise RuntimeError("single-turn passive capture does not support continuation")
-
             messages = deepcopy(request["messages"])
             tools = deepcopy(request["tools"])
-            image_data, video_data = await self._codec.extract_multi_modal_data(messages)
-            context_ids = tuple(
-                self._codec.encode_full(
+            incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
+            selected_chain = self._select_chain(
+                tools=tools,
+                incoming_message_prefix_hashes=incoming_message_prefix_hashes,
+            )
+            sampling_params = deepcopy(self._sampling_params)
+            sampling_params.update(deepcopy(request["sampling_params"]))
+
+            if selected_chain is None:
+                image_data, video_data = await self._codec.extract_multi_modal_data(messages)
+                prompt_ids = self._codec.encode_full(
                     messages,
                     tools=tools,
                     image_data=image_data,
                     video_data=video_data,
                 )
-            )
-            merged_sampling_params = deepcopy(self._sampling_params)
-            merged_sampling_params.update(deepcopy(request["sampling_params"]))
-            if self._response_length is not None:
-                merged_sampling_params["max_tokens"] = min(
-                    merged_sampling_params.get("max_tokens", self._response_length),
-                    self._response_length,
+                buffer = TrajectoryBuffer(prompt_ids=prompt_ids)
+                chain_id = None
+                turn_id = 1
+            else:
+                buffer = self._copy_trajectory_buffer(selected_chain.buffer)
+                image_data, video_data = self._copy_chain_media(selected_chain)
+                chain_id = selected_chain.chain_id
+                turn_id = sum(
+                    1 for message in selected_chain.message_history if message.get("role") == "assistant"
+                ) + 1
+                incremental_messages = messages[len(selected_chain.message_history) :]
+                incremental_ids: list[int] = []
+                new_image_data = None
+                new_video_data = None
+                already_exhausted = (
+                    self._response_length is not None and len(buffer.response_mask) >= self._response_length
                 )
-            prepared = _PreparedSingleTurnCapture(
+                if incremental_messages and not already_exhausted:
+                    new_image_data, new_video_data = await self._codec.extract_multi_modal_data(incremental_messages)
+                    incremental_ids = self._codec.encode_incremental(
+                        incremental_messages,
+                        image_data=new_image_data,
+                        video_data=new_video_data,
+                    )
+                if already_exhausted or (
+                    self._response_length is not None
+                    and len(buffer.response_mask) + len(incremental_ids) >= self._response_length
+                ):
+                    return _CaptureTransaction(
+                        self,
+                        _PreparedCapture(
+                            buffer=buffer,
+                            context_ids=tuple(buffer.prompt_ids + buffer.response_ids),
+                            sampling_params={},
+                            messages=messages,
+                            tools=tools,
+                            image_data=image_data,
+                            video_data=video_data,
+                            chain_id=chain_id,
+                            turn_id=turn_id,
+                            incoming_message_prefix_hashes=incoming_message_prefix_hashes,
+                            length_exhausted_trajectory=self._build_materialized_trajectory(
+                                chain=selected_chain,
+                                extra_fields={"materialization_reason": "max_response_length"},
+                            ),
+                        ),
+                    )
+                buffer.response_ids.extend(incremental_ids)
+                buffer.response_mask.extend([0] * len(incremental_ids))
+                if sampling_params.get("logprobs", False):
+                    buffer.response_logprobs.extend([0.0] * len(incremental_ids))
+                if new_image_data:
+                    if image_data is None:
+                        image_data = []
+                    image_data.extend(new_image_data)
+                if new_video_data:
+                    if video_data is None:
+                        video_data = []
+                    video_data.extend(new_video_data)
+
+            context_ids = tuple(buffer.prompt_ids + buffer.response_ids)
+            remaining_response_budget = (
+                self._response_length - len(buffer.response_mask) if self._response_length is not None else None
+            )
+            if remaining_response_budget is not None:
+                sampling_params["max_tokens"] = min(
+                    sampling_params.get("max_tokens", remaining_response_budget),
+                    remaining_response_budget,
+                )
+            prepared = _PreparedCapture(
+                buffer=buffer,
                 context_ids=context_ids,
-                sampling_params=merged_sampling_params,
+                sampling_params=sampling_params,
                 messages=messages,
                 tools=tools,
                 image_data=self._copy_media_list(image_data),
                 video_data=self._copy_media_list(video_data),
+                chain_id=chain_id,
+                turn_id=turn_id,
+                incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
             )
             return _CaptureTransaction(self, prepared)
 
-    async def _commit_single_turn_capture(
+    async def _commit_capture(
         self,
-        prepared: _PreparedSingleTurnCapture,
+        prepared: _PreparedCapture,
         generation: CapturedGeneration,
     ) -> CaptureReceipt:
         async with self.request_lock:
             if self.phase != SessionPhase.ACTIVE:
                 raise SessionLifecycleError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
-            if self.active_chains:
-                raise RuntimeError("single-turn passive capture does not support continuation")
+
+            if prepared.length_exhausted_trajectory is not None:
+                if prepared.chain_id is None:
+                    raise RuntimeError("length-exhausted capture is missing its chain")
+                chain_index, _ = self._find_active_chain(prepared.chain_id)
+                self.materialized_chains.append(
+                    MaterializedChain(
+                        trajectory=prepared.length_exhausted_trajectory,
+                        order_seq=self._next_order_seq(),
+                    )
+                )
+                del self.active_chains[chain_index]
+                self._touch()
+                return CaptureReceipt(
+                    prompt_ids=tuple(generation.prompt_ids),
+                    response_ids=(),
+                    response_mask=(),
+                    response_logprobs=(),
+                    chain_id=prepared.chain_id,
+                    turn_id=prepared.turn_id,
+                    usage=CaptureUsage(prompt_tokens=len(generation.prompt_ids), completion_tokens=0),
+                    assistant_message={"role": "assistant", "content": ""},
+                    finish_reason="length",
+                    routed_experts=generation.routed_experts,
+                    routing_metadata=generation.routing_metadata,
+                )
 
             assistant_message = mutable_capture_mapping(generation.assistant_message)
             message_history = [*prepared.messages, assistant_message]
-            message_prefix_hashes = self._extend_message_prefix_hashes([], message_history)
-            chain_id = self._allocate_chain_id()
+            message_prefix_hashes = self._extend_message_prefix_hashes(
+                prepared.incoming_message_prefix_hashes,
+                [assistant_message],
+            )
             order_seq = self._next_order_seq()
             response_ids = tuple(generation.completion_ids)
             response_logprobs = tuple(generation.completion_logprobs)
-            self.active_chains.append(
-                ChainState(
-                    chain_id=chain_id,
-                    message_history=message_history,
-                    message_tip_hash=message_prefix_hashes[-1],
-                    active_tool_schemas=prepared.tools,
-                    buffer=TrajectoryBuffer(
-                        prompt_ids=list(generation.prompt_ids),
-                        response_ids=list(response_ids),
-                        response_mask=[1] * len(response_ids),
-                        response_logprobs=list(response_logprobs),
-                        routed_experts=mutable_capture_value(generation.routed_experts),
-                    ),
-                    image_data=self._copy_media_list(prepared.image_data),
-                    video_data=self._copy_media_list(prepared.video_data),
-                    updated_seq=order_seq,
-                )
+            if prepared.chain_id is None:
+                prepared.buffer.prompt_ids = list(generation.prompt_ids)
+            prepared.buffer.response_ids.extend(response_ids)
+            prepared.buffer.response_mask.extend([1] * len(response_ids))
+            prepared.buffer.response_logprobs.extend(response_logprobs)
+            if generation.routed_experts is not None:
+                prepared.buffer.routed_experts = mutable_capture_value(generation.routed_experts)
+            if prepared.chain_id is None:
+                chain_id = self._allocate_chain_id()
+                chain_index = None
+            else:
+                chain_id = prepared.chain_id
+                chain_index, _ = self._find_active_chain(chain_id)
+            next_chain = ChainState(
+                chain_id=chain_id,
+                message_history=message_history,
+                message_tip_hash=message_prefix_hashes[-1],
+                active_tool_schemas=prepared.tools,
+                buffer=prepared.buffer,
+                image_data=self._copy_media_list(prepared.image_data),
+                video_data=self._copy_media_list(prepared.video_data),
+                updated_seq=order_seq,
             )
+            if chain_index is None:
+                self.active_chains.append(next_chain)
+            else:
+                self.active_chains[chain_index] = next_chain
             self._touch()
             return CaptureReceipt(
                 prompt_ids=tuple(generation.prompt_ids),
@@ -248,7 +363,7 @@ class TrajectorySession:
                 response_mask=(1,) * len(response_ids),
                 response_logprobs=response_logprobs,
                 chain_id=chain_id,
-                turn_id=1,
+                turn_id=prepared.turn_id,
                 usage=CaptureUsage(
                     prompt_tokens=len(generation.prompt_ids),
                     completion_tokens=len(response_ids),
@@ -356,6 +471,39 @@ class TrajectorySession:
             ensure_ascii=False,
         ).encode("utf-8")
         return hashlib.sha256(b"uni-agent-message-v1\0" + canonical_json).hexdigest()
+
+    def _select_chain(
+        self,
+        *,
+        tools: list[dict[str, Any]] | None,
+        incoming_message_prefix_hashes: list[str],
+    ) -> ChainState | None:
+        candidates = [
+            chain
+            for chain in self.active_chains
+            if chain.chain_id not in self.reserved_chain_ids
+            and chain.active_tool_schemas == tools
+            and self._is_chain_prefix_hash_match(
+                chain=chain,
+                incoming_message_prefix_hashes=incoming_message_prefix_hashes,
+            )
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda chain: (len(chain.message_history), chain.updated_seq, chain.chain_id))
+
+    def _is_chain_prefix_hash_match(
+        self,
+        *,
+        chain: ChainState,
+        incoming_message_prefix_hashes: list[str],
+    ) -> bool:
+        history_len = len(chain.message_history)
+        if history_len > len(incoming_message_prefix_hashes):
+            return False
+        if history_len == 0:
+            return True
+        return chain.message_tip_hash == incoming_message_prefix_hashes[history_len - 1]
 
     def _find_active_chain(self, chain_id: int) -> tuple[int, ChainState]:
         for index, chain in enumerate(self.active_chains):

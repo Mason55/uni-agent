@@ -3,12 +3,16 @@ import subprocess
 import sys
 from dataclasses import FrozenInstanceError
 
+import numpy as np
 import pytest
 
 from tests.uni_agent.support import FakeProcessor, FakeTokenizer, fake_vision_info_extractor
 from uni_agent.gateway.session import (
     CapturedGeneration,
+    CaptureErrorCode,
     CaptureReceipt,
+    CaptureTransactionError,
+    CaptureValidationError,
     MessageCodec,
     SessionHandle,
     SessionLifecycleError,
@@ -115,7 +119,7 @@ async def test_single_turn_passive_capture_returns_receipt_and_finalized_traject
         },
     }
     expected_prompt_ids = tuple(ord(char) for char in "user:Say OK\nassistant:")
-    routed_experts = {"layers": [[[1, 2], [3, 4]]]}
+    routed_experts = [[[1, 2]]] * (len(expected_prompt_ids) + 2)
 
     transaction = await session.capture(request)
 
@@ -152,10 +156,11 @@ async def test_single_turn_passive_capture_returns_receipt_and_finalized_traject
     assert receipt.usage.completion_tokens == 2
     assert receipt.assistant_message == {"role": "assistant", "content": "OK"}
     assert receipt.finish_reason == "stop"
-    assert receipt.routed_experts == {"layers": (((1, 2), (3, 4)),)}
+    assert len(receipt.routed_experts) == len(expected_prompt_ids) + 2
+    assert receipt.routed_experts[0] == ((1, 2),)
     assert receipt.routing_metadata == {"model": "fixture-model"}
 
-    routed_experts["layers"][0][0][0] = 99
+    routed_experts[0][0][0] = 99
     request["messages"][0]["content"] = "caller-mutated"
     request["sampling_params"]["custom"]["adapter"] = "caller-mutated"
     exposed_sampling_params = transaction.sampling_params
@@ -168,9 +173,10 @@ async def test_single_turn_passive_capture_returns_receipt_and_finalized_traject
     assert trajectory.response_ids == list(receipt.response_ids)
     assert trajectory.response_mask == list(receipt.response_mask)
     assert trajectory.response_logprobs == list(receipt.response_logprobs)
-    assert trajectory.routed_experts == {"layers": [[[1, 2], [3, 4]]]}
-    trajectory.routed_experts["layers"][0][0][0] = 77
-    assert receipt.routed_experts == {"layers": (((1, 2), (3, 4)),)}
+    assert len(trajectory.routed_experts) == len(expected_prompt_ids) + 2
+    assert trajectory.routed_experts[0] == [[1, 2]]
+    trajectory.routed_experts[0][0][0] = 77
+    assert receipt.routed_experts[0] == ((1, 2),)
 
 
 @pytest.mark.asyncio
@@ -252,7 +258,7 @@ async def test_passive_capture_linear_continuation_accumulates_context_and_model
             completion_ids=(79, 78, 69),
             completion_logprobs=(-0.1, -0.2, -0.3),
             stop_reason="completed",
-            routed_experts={"turn": 1},
+            routed_experts=[[[1]]] * (len(first_transaction.context_ids) + 3),
         )
     )
     continuation_messages = [
@@ -278,7 +284,7 @@ async def test_passive_capture_linear_continuation_accumulates_context_and_model
             completion_ids=(84, 87, 79),
             completion_logprobs=(-0.4, -0.5, -0.6),
             stop_reason="completed",
-            routed_experts={"turn": 2},
+            routed_experts=[[[2]]] * (len(continuation.context_ids) + 3),
         )
     )
 
@@ -288,7 +294,8 @@ async def test_passive_capture_linear_continuation_accumulates_context_and_model
     assert second_receipt.response_ids == (84, 87, 79)
     assert second_receipt.response_mask == (1, 1, 1)
     assert second_receipt.response_logprobs == (-0.4, -0.5, -0.6)
-    assert second_receipt.routed_experts == {"turn": 2}
+    assert len(second_receipt.routed_experts) == len(continuation.context_ids) + 3
+    assert second_receipt.routed_experts[0] == ((2,),)
 
     [trajectory] = await session.finalize()
     assert trajectory.response_ids == [*first_receipt.response_ids, *incremental_ids, *second_receipt.response_ids]
@@ -302,7 +309,8 @@ async def test_passive_capture_linear_continuation_accumulates_context_and_model
         -0.5,
         -0.6,
     ]
-    assert trajectory.routed_experts == {"turn": 2}
+    assert len(trajectory.routed_experts) == len(continuation.context_ids) + 3
+    assert trajectory.routed_experts[0] == [[2]]
 
 
 @pytest.mark.asyncio
@@ -678,7 +686,7 @@ async def test_passive_capture_cleanup_releases_chain_for_every_exit_path():
             stop_reason="completed",
         )
     )
-    assert retry_receipt.chain_id == first_receipt.chain_id
+    assert retry_receipt.chain_id != first_receipt.chain_id
 
     third_messages = [
         *continuation_messages,
@@ -695,7 +703,7 @@ async def test_passive_capture_cleanup_releases_chain_for_every_exit_path():
             stop_reason="completed",
         )
     )
-    assert third_receipt.chain_id == first_receipt.chain_id
+    assert third_receipt.chain_id == retry_receipt.chain_id
     [trajectory] = await session.finalize()
     assert trajectory.response_ids[-1] == 72
 
@@ -849,3 +857,307 @@ async def test_passive_capture_main_and_subagent_commit_to_reserved_chains_out_o
     trajectories = await session.finalize()
     assert len(trajectories) == 2
     assert {trajectory.response_ids[-1] for trajectory in trajectories} == {109, 115}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation_fields", "error_code"),
+    [
+        ({"prompt_ids": None}, CaptureErrorCode.MISSING_PROMPT_IDS),
+        ({"prompt_ids": (999,)}, CaptureErrorCode.PROMPT_MISMATCH),
+        ({"completion_ids": None}, CaptureErrorCode.MISSING_COMPLETION_IDS),
+        ({"completion_logprobs": None}, CaptureErrorCode.MISSING_LOGPROBS),
+        ({"completion_logprobs": ()}, CaptureErrorCode.LOGPROB_LENGTH_MISMATCH),
+        ({"completion_logprobs": ("bad",)}, CaptureErrorCode.MALFORMED_LOGPROBS),
+        ({"completion_logprobs": 0.1}, CaptureErrorCode.MALFORMED_LOGPROBS),
+        ({"completion_logprobs": (float("nan"),)}, CaptureErrorCode.MALFORMED_LOGPROBS),
+        ({"completion_logprobs": (float("inf"),)}, CaptureErrorCode.MALFORMED_LOGPROBS),
+        (
+            {"completion_ids": (), "completion_logprobs": (), "stop_reason": "completed"},
+            CaptureErrorCode.EMPTY_COMPLETION,
+        ),
+    ],
+)
+async def test_passive_capture_rejects_invalid_rollout_truth_without_materializing(
+    generation_fields,
+    error_code,
+):
+    session = TrajectorySession(
+        SessionHandle(session_id=f"passive-validation-{error_code.value}"),
+        MessageCodec(FakeTokenizer()),
+    )
+    transaction = await session.capture(
+        {
+            "messages": [{"role": "user", "content": "validate"}],
+            "tools": None,
+            "sampling_params": {},
+        }
+    )
+    fields = {
+        "assistant_message": {"role": "assistant", "content": "X"},
+        "prompt_ids": transaction.context_ids,
+        "completion_ids": (88,),
+        "completion_logprobs": (-0.1,),
+        "stop_reason": "completed",
+    }
+    fields.update(generation_fields)
+
+    with pytest.raises(CaptureValidationError) as error:
+        await transaction.commit(CapturedGeneration(**fields))
+
+    assert error.value.code is error_code
+    assert await session.finalize() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routed_experts", "error_code"),
+    [
+        ([[1], [2]], CaptureErrorCode.ROUTING_SHAPE_MISMATCH),
+        ([[[1]], [[2, 3]]], CaptureErrorCode.ROUTING_SHAPE_MISMATCH),
+        ([[[1]]], CaptureErrorCode.ROUTING_LENGTH_MISMATCH),
+        (np.zeros((1, 1, 1)), CaptureErrorCode.ROUTING_LENGTH_MISMATCH),
+    ],
+)
+async def test_passive_capture_rejects_misaligned_routed_experts(routed_experts, error_code):
+    session = TrajectorySession(
+        SessionHandle(session_id=f"passive-routing-{error_code.value}"),
+        MessageCodec(FakeTokenizer()),
+    )
+    transaction = await session.capture(
+        {
+            "messages": [{"role": "user", "content": "route"}],
+            "tools": None,
+            "sampling_params": {},
+        }
+    )
+
+    with pytest.raises(CaptureValidationError) as error:
+        await transaction.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": "X"},
+                prompt_ids=transaction.context_ids,
+                completion_ids=(88,),
+                completion_logprobs=(-0.1,),
+                stop_reason="completed",
+                routed_experts=routed_experts,
+            )
+        )
+
+    assert error.value.code is error_code
+    assert await session.finalize() == []
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_accepts_aligned_ndarray_routed_experts():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-routing-ndarray"),
+        MessageCodec(FakeTokenizer()),
+    )
+    transaction = await session.capture(
+        {
+            "messages": [{"role": "user", "content": "route"}],
+            "tools": None,
+            "sampling_params": {},
+        }
+    )
+    routed_experts = np.zeros((len(transaction.context_ids) + 1, 2, 1), dtype=np.int64)
+
+    receipt = await transaction.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "X"},
+            prompt_ids=transaction.context_ids,
+            completion_ids=(88,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+            routed_experts=routed_experts,
+        )
+    )
+
+    assert receipt.routed_experts.shape == routed_experts.shape
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_validation_failure_drops_chain_and_allows_independent_recovery():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-validation-isolation"),
+        MessageCodec(FakeTokenizer()),
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    first_receipt = await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first.context_ids,
+            completion_ids=(79,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+    continuation_request = {
+        "messages": continuation_messages,
+        "tools": None,
+        "sampling_params": {},
+    }
+    invalid = await session.capture(continuation_request)
+
+    with pytest.raises(CaptureValidationError) as error:
+        await invalid.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": "BAD"},
+                prompt_ids=(999,),
+                completion_ids=(66,),
+                completion_logprobs=(-0.2,),
+                stop_reason="completed",
+            )
+        )
+    assert error.value.code is CaptureErrorCode.PROMPT_MISMATCH
+    assert session.snapshot_state()["num_active_chains"] == 0
+
+    recovery = await session.capture(continuation_request)
+    recovery_receipt = await recovery.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "GOOD"},
+            prompt_ids=recovery.context_ids,
+            completion_ids=(71,),
+            completion_logprobs=(-0.3,),
+            stop_reason="completed",
+        )
+    )
+
+    assert recovery_receipt.chain_id != first_receipt.chain_id
+    [trajectory] = await session.finalize()
+    assert trajectory.response_ids == [71]
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_commit_failure_drops_selected_chain():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-commit-failure-isolation"),
+        MessageCodec(FakeTokenizer()),
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first.context_ids,
+            completion_ids=(79,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+    failed = await session.capture(
+        {"messages": continuation_messages, "tools": None, "sampling_params": {}}
+    )
+
+    with pytest.raises(TypeError, match="JSON serializable"):
+        await failed.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": object()},
+                prompt_ids=failed.context_ids,
+                completion_ids=(66,),
+                completion_logprobs=(-0.2,),
+                stop_reason="completed",
+            )
+        )
+
+    assert session.snapshot_state()["num_active_chains"] == 0
+    assert await session.finalize() == []
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_transaction_and_session_lifecycle_errors_are_classified():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-classified-lifecycle"),
+        MessageCodec(FakeTokenizer()),
+    )
+    request = {
+        "messages": [{"role": "user", "content": "first"}],
+        "tools": None,
+        "sampling_params": {},
+    }
+    committed = await session.capture(request)
+    generation = CapturedGeneration(
+        assistant_message={"role": "assistant", "content": "ONE"},
+        prompt_ids=committed.context_ids,
+        completion_ids=(79,),
+        completion_logprobs=(-0.1,),
+        stop_reason="completed",
+    )
+    await committed.commit(generation)
+
+    with pytest.raises(CaptureTransactionError) as duplicate:
+        await committed.commit(generation)
+    assert duplicate.value.code is CaptureErrorCode.DUPLICATE_COMMIT
+
+    continuation_request = {
+        "messages": [
+            *request["messages"],
+            {"role": "assistant", "content": "ONE"},
+            {"role": "user", "content": "next"},
+        ],
+        "tools": None,
+        "sampling_params": {},
+    }
+    rolled_back = await session.capture(continuation_request)
+    await rolled_back.rollback()
+    with pytest.raises(CaptureTransactionError) as closed:
+        await rolled_back.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": "TWO"},
+                prompt_ids=rolled_back.context_ids,
+                completion_ids=(84,),
+                completion_logprobs=(-0.2,),
+                stop_reason="completed",
+            )
+        )
+    assert closed.value.code is CaptureErrorCode.TRANSACTION_CLOSED
+    with pytest.raises(CaptureTransactionError) as closed_context:
+        async with rolled_back:
+            pass
+    assert closed_context.value.code is CaptureErrorCode.TRANSACTION_CLOSED
+
+    assert await session.finalize() == []
+    with pytest.raises(SessionLifecycleError) as phase_error:
+        await session.capture(request)
+    assert phase_error.value.code is CaptureErrorCode.INVALID_SESSION_PHASE
+
+    commit_after_finalize_session = TrajectorySession(
+        SessionHandle(session_id="passive-commit-after-finalize"),
+        MessageCodec(FakeTokenizer()),
+    )
+    seed = await commit_after_finalize_session.capture(request)
+    await seed.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=seed.context_ids,
+            completion_ids=(79,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    pending = await commit_after_finalize_session.capture(continuation_request)
+    [stable_trajectory] = await commit_after_finalize_session.finalize()
+    assert stable_trajectory.response_ids == [79]
+    with pytest.raises(SessionLifecycleError) as commit_phase_error:
+        await pending.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": "LATE"},
+                prompt_ids=pending.context_ids,
+                completion_ids=(76,),
+                completion_logprobs=(-0.3,),
+                stop_reason="completed",
+            )
+        )
+    assert commit_phase_error.value.code is CaptureErrorCode.INVALID_SESSION_PHASE

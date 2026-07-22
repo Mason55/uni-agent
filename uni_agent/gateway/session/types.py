@@ -76,18 +76,25 @@ class CapturedGeneration:
     """Immutable rollout truth supplied by an external generation owner."""
 
     assistant_message: Mapping[str, Any]
-    prompt_ids: tuple[int, ...]
-    completion_ids: tuple[int, ...]
-    completion_logprobs: tuple[float, ...]
+    prompt_ids: tuple[int, ...] | None
+    completion_ids: tuple[int, ...] | None
+    completion_logprobs: tuple[float, ...] | None
     stop_reason: str
     routed_experts: Any | None = None
     routing_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "assistant_message", _freeze_capture_value(self.assistant_message))
-        object.__setattr__(self, "prompt_ids", tuple(self.prompt_ids))
-        object.__setattr__(self, "completion_ids", tuple(self.completion_ids))
-        object.__setattr__(self, "completion_logprobs", tuple(self.completion_logprobs))
+        if self.prompt_ids is not None:
+            object.__setattr__(self, "prompt_ids", tuple(self.prompt_ids))
+        if self.completion_ids is not None:
+            object.__setattr__(self, "completion_ids", tuple(self.completion_ids))
+        if self.completion_logprobs is not None:
+            try:
+                completion_logprobs = tuple(self.completion_logprobs)
+            except TypeError:
+                completion_logprobs = _freeze_capture_value(self.completion_logprobs)
+            object.__setattr__(self, "completion_logprobs", completion_logprobs)
         if self.routed_experts is not None:
             object.__setattr__(self, "routed_experts", _freeze_capture_value(self.routed_experts))
         if self.routing_metadata is not None:

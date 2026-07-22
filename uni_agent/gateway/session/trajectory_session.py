@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from numbers import Real
 from typing import TYPE_CHECKING, Any
 
 from uni_agent.gateway.session.types import (
@@ -38,8 +40,44 @@ class SessionPhase(str, Enum):
     ABORTED = "ABORTED"
 
 
-class SessionLifecycleError(RuntimeError):
+class CaptureErrorCode(str, Enum):
+    """Stable categories for transport-independent capture failures."""
+
+    MISSING_PROMPT_IDS = "missing_prompt_ids"
+    PROMPT_MISMATCH = "prompt_mismatch"
+    MISSING_COMPLETION_IDS = "missing_completion_ids"
+    MISSING_LOGPROBS = "missing_logprobs"
+    LOGPROB_LENGTH_MISMATCH = "logprob_length_mismatch"
+    MALFORMED_LOGPROBS = "malformed_logprobs"
+    EMPTY_COMPLETION = "empty_completion"
+    ROUTING_SHAPE_MISMATCH = "routing_shape_mismatch"
+    ROUTING_LENGTH_MISMATCH = "routing_length_mismatch"
+    DUPLICATE_COMMIT = "duplicate_commit"
+    TRANSACTION_CLOSED = "transaction_closed"
+    INVALID_SESSION_PHASE = "invalid_session_phase"
+
+
+class CaptureDomainError(RuntimeError):
+    """Base error carrying a stable category for transport adapters."""
+
+    def __init__(self, code: CaptureErrorCode, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class CaptureValidationError(CaptureDomainError):
+    """Raised when upstream rollout truth is missing or misaligned."""
+
+
+class CaptureTransactionError(CaptureDomainError):
+    """Raised when a capture transaction operation violates its lifecycle."""
+
+
+class SessionLifecycleError(CaptureDomainError):
     """Raised when an operation is invalid for the current session phase."""
+
+    def __init__(self, message: str):
+        super().__init__(CaptureErrorCode.INVALID_SESSION_PHASE, message)
 
 
 @dataclass
@@ -91,6 +129,7 @@ class _PreparedCapture:
     image_data: list[Any] | None
     video_data: list[Any] | None
     chain_id: int | None
+    base_chain_updated_seq: int | None
     turn_id: int
     incoming_message_prefix_hashes: list[str]
     length_exhausted_trajectory: Trajectory | None = None
@@ -144,7 +183,11 @@ class _CaptureTransaction:
     async def __aenter__(self) -> _CaptureTransaction:
         """Enter the transaction scope used around externally-owned rollout."""
         if self._closed:
-            raise RuntimeError("capture transaction is closed")
+            await self._session._invalidate_failed_transaction(self._prepared)
+            raise CaptureTransactionError(
+                CaptureErrorCode.TRANSACTION_CLOSED,
+                "capture transaction is closed",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
@@ -156,9 +199,16 @@ class _CaptureTransaction:
         """Commit externally-produced rollout truth and return its receipt."""
         async with self._commit_lock:
             if self._receipt is not None:
-                raise RuntimeError("capture transaction is already committed")
+                raise CaptureTransactionError(
+                    CaptureErrorCode.DUPLICATE_COMMIT,
+                    "capture transaction is already committed",
+                )
             if self._closed:
-                raise RuntimeError("capture transaction is closed")
+                await self._session._invalidate_failed_transaction(self._prepared)
+                raise CaptureTransactionError(
+                    CaptureErrorCode.TRANSACTION_CLOSED,
+                    "capture transaction is closed",
+                )
             try:
                 self._receipt = await self._session._commit_capture(self._prepared, generation)
                 return self._receipt
@@ -286,6 +336,7 @@ class TrajectorySession:
                         image_data=image_data,
                         video_data=video_data,
                         chain_id=chain_id,
+                        base_chain_updated_seq=selected_chain.updated_seq,
                         turn_id=turn_id,
                         incoming_message_prefix_hashes=incoming_message_prefix_hashes,
                         length_exhausted_trajectory=self._build_materialized_trajectory(
@@ -325,6 +376,7 @@ class TrajectorySession:
                 image_data=self._copy_media_list(image_data),
                 video_data=self._copy_media_list(video_data),
                 chain_id=chain_id,
+                base_chain_updated_seq=selected_chain.updated_seq if selected_chain is not None else None,
                 turn_id=turn_id,
                 incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
             )
@@ -345,85 +397,191 @@ class TrajectorySession:
             if self.phase != SessionPhase.ACTIVE:
                 raise SessionLifecycleError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
 
-            if prepared.length_exhausted_trajectory is not None:
-                if prepared.chain_id is None:
-                    raise RuntimeError("length-exhausted capture is missing its chain")
-                chain_index, _ = self._find_active_chain(prepared.chain_id)
-                self.materialized_chains.append(
-                    MaterializedChain(
-                        trajectory=prepared.length_exhausted_trajectory,
-                        order_seq=self._next_order_seq(),
-                    )
-                )
-                del self.active_chains[chain_index]
-                self._touch()
-                return CaptureReceipt(
-                    prompt_ids=tuple(generation.prompt_ids),
-                    response_ids=(),
-                    response_mask=(),
-                    response_logprobs=(),
-                    chain_id=prepared.chain_id,
-                    turn_id=prepared.turn_id,
-                    usage=CaptureUsage(prompt_tokens=len(generation.prompt_ids), completion_tokens=0),
-                    assistant_message={"role": "assistant", "content": ""},
-                    finish_reason="length",
-                    routed_experts=generation.routed_experts,
-                    routing_metadata=generation.routing_metadata,
-                )
+            try:
+                self._validate_captured_generation(prepared, generation)
+                return self._commit_validated_capture(prepared, generation)
+            except Exception:
+                self._invalidate_capture_chain(prepared)
+                raise
 
-            assistant_message = mutable_capture_mapping(generation.assistant_message)
-            message_history = [*prepared.messages, assistant_message]
-            message_prefix_hashes = self._extend_message_prefix_hashes(
-                prepared.incoming_message_prefix_hashes,
-                [assistant_message],
-            )
-            order_seq = self._next_order_seq()
-            response_ids = tuple(generation.completion_ids)
-            response_logprobs = tuple(generation.completion_logprobs)
+    def _commit_validated_capture(
+        self,
+        prepared: _PreparedCapture,
+        generation: CapturedGeneration,
+    ) -> CaptureReceipt:
+        assert generation.prompt_ids is not None
+        assert generation.completion_ids is not None
+        assert generation.completion_logprobs is not None
+        if prepared.length_exhausted_trajectory is not None:
             if prepared.chain_id is None:
-                prepared.buffer.prompt_ids = list(generation.prompt_ids)
-            prepared.buffer.response_ids.extend(response_ids)
-            prepared.buffer.response_mask.extend([1] * len(response_ids))
-            prepared.buffer.response_logprobs.extend(response_logprobs)
-            if generation.routed_experts is not None:
-                prepared.buffer.routed_experts = mutable_capture_value(generation.routed_experts)
-            if prepared.chain_id is None:
-                chain_id = self._allocate_chain_id()
-                chain_index = None
-            else:
-                chain_id = prepared.chain_id
-                chain_index, _ = self._find_active_chain(chain_id)
-            next_chain = ChainState(
-                chain_id=chain_id,
-                message_history=message_history,
-                message_tip_hash=message_prefix_hashes[-1],
-                active_tool_schemas=prepared.tools,
-                buffer=prepared.buffer,
-                image_data=self._copy_media_list(prepared.image_data),
-                video_data=self._copy_media_list(prepared.video_data),
-                updated_seq=order_seq,
+                raise RuntimeError("length-exhausted capture is missing its chain")
+            chain_index, _ = self._find_active_chain(prepared.chain_id)
+            self.materialized_chains.append(
+                MaterializedChain(
+                    trajectory=prepared.length_exhausted_trajectory,
+                    order_seq=self._next_order_seq(),
+                )
             )
-            if chain_index is None:
-                self.active_chains.append(next_chain)
-            else:
-                self.active_chains[chain_index] = next_chain
+            del self.active_chains[chain_index]
             self._touch()
             return CaptureReceipt(
-                prompt_ids=tuple(generation.prompt_ids),
-                response_ids=response_ids,
-                response_mask=(1,) * len(response_ids),
-                response_logprobs=response_logprobs,
-                chain_id=chain_id,
+                prompt_ids=generation.prompt_ids,
+                response_ids=(),
+                response_mask=(),
+                response_logprobs=(),
+                chain_id=prepared.chain_id,
                 turn_id=prepared.turn_id,
-                usage=CaptureUsage(
-                    prompt_tokens=len(generation.prompt_ids),
-                    completion_tokens=len(response_ids),
-                ),
-                assistant_message=assistant_message,
-                finish_reason=normalize_finish_reason(generation.stop_reason),
+                usage=CaptureUsage(prompt_tokens=len(generation.prompt_ids), completion_tokens=0),
+                assistant_message={"role": "assistant", "content": ""},
+                finish_reason="length",
                 routed_experts=generation.routed_experts,
                 routing_metadata=generation.routing_metadata,
             )
+
+        assistant_message = mutable_capture_mapping(generation.assistant_message)
+        message_history = [*prepared.messages, assistant_message]
+        message_prefix_hashes = self._extend_message_prefix_hashes(
+            prepared.incoming_message_prefix_hashes,
+            [assistant_message],
+        )
+        order_seq = self._next_order_seq()
+        response_ids = generation.completion_ids
+        response_logprobs = generation.completion_logprobs
+        if prepared.chain_id is None:
+            prepared.buffer.prompt_ids = list(generation.prompt_ids)
+        prepared.buffer.response_ids.extend(response_ids)
+        prepared.buffer.response_mask.extend([1] * len(response_ids))
+        prepared.buffer.response_logprobs.extend(response_logprobs)
+        if generation.routed_experts is not None:
+            prepared.buffer.routed_experts = mutable_capture_value(generation.routed_experts)
+        if prepared.chain_id is None:
+            chain_id = self._allocate_chain_id()
+            chain_index = None
+        else:
+            chain_id = prepared.chain_id
+            chain_index, _ = self._find_active_chain(chain_id)
+        next_chain = ChainState(
+            chain_id=chain_id,
+            message_history=message_history,
+            message_tip_hash=message_prefix_hashes[-1],
+            active_tool_schemas=prepared.tools,
+            buffer=prepared.buffer,
+            image_data=self._copy_media_list(prepared.image_data),
+            video_data=self._copy_media_list(prepared.video_data),
+            updated_seq=order_seq,
+        )
+        if chain_index is None:
+            self.active_chains.append(next_chain)
+        else:
+            self.active_chains[chain_index] = next_chain
+        self._touch()
+        return CaptureReceipt(
+            prompt_ids=generation.prompt_ids,
+            response_ids=response_ids,
+            response_mask=(1,) * len(response_ids),
+            response_logprobs=response_logprobs,
+            chain_id=chain_id,
+            turn_id=prepared.turn_id,
+            usage=CaptureUsage(
+                prompt_tokens=len(generation.prompt_ids),
+                completion_tokens=len(response_ids),
+            ),
+            assistant_message=assistant_message,
+            finish_reason=normalize_finish_reason(generation.stop_reason),
+            routed_experts=generation.routed_experts,
+            routing_metadata=generation.routing_metadata,
+        )
+
+    def _validate_captured_generation(
+        self,
+        prepared: _PreparedCapture,
+        generation: CapturedGeneration,
+    ) -> None:
+        if generation.prompt_ids is None:
+            raise CaptureValidationError(CaptureErrorCode.MISSING_PROMPT_IDS, "upstream prompt token IDs are required")
+        if generation.prompt_ids != prepared.context_ids:
+            raise CaptureValidationError(
+                CaptureErrorCode.PROMPT_MISMATCH,
+                "upstream prompt token IDs do not match prepared context IDs",
+            )
+        if generation.completion_ids is None:
+            raise CaptureValidationError(
+                CaptureErrorCode.MISSING_COMPLETION_IDS,
+                "upstream completion token IDs are required",
+            )
+        if generation.completion_logprobs is None:
+            raise CaptureValidationError(
+                CaptureErrorCode.MISSING_LOGPROBS,
+                "upstream completion log-probabilities are required",
+            )
+        if not isinstance(generation.completion_logprobs, tuple):
+            raise CaptureValidationError(
+                CaptureErrorCode.MALFORMED_LOGPROBS,
+                "completion log-probabilities must be a finite numeric sequence",
+            )
+        if len(generation.completion_logprobs) != len(generation.completion_ids):
+            raise CaptureValidationError(
+                CaptureErrorCode.LOGPROB_LENGTH_MISMATCH,
+                "completion log-probabilities must align with completion token IDs",
+            )
+        for logprob in generation.completion_logprobs:
+            if isinstance(logprob, bool) or not isinstance(logprob, Real) or not math.isfinite(logprob):
+                raise CaptureValidationError(
+                    CaptureErrorCode.MALFORMED_LOGPROBS,
+                    "completion log-probabilities must be finite numbers",
+                )
+        if not generation.completion_ids and normalize_finish_reason(generation.stop_reason) != "length":
+            raise CaptureValidationError(
+                CaptureErrorCode.EMPTY_COMPLETION,
+                "empty completion is only valid for an explicit length termination",
+            )
+        if generation.routed_experts is not None:
+            routing_shape = self._capture_value_shape(generation.routed_experts)
+            if routing_shape is None or len(routing_shape) != 3 or routing_shape[1] <= 0 or routing_shape[2] <= 0:
+                raise CaptureValidationError(
+                    CaptureErrorCode.ROUTING_SHAPE_MISMATCH,
+                    "routed_experts must have rectangular [sequence, layers, topk] shape",
+                )
+            expected_sequence_length = len(generation.prompt_ids) + len(generation.completion_ids)
+            if routing_shape[0] != expected_sequence_length:
+                raise CaptureValidationError(
+                    CaptureErrorCode.ROUTING_LENGTH_MISMATCH,
+                    "routed_experts sequence dimension must match prompt plus completion length",
+                )
+
+    def _capture_value_shape(self, value: Any) -> tuple[int, ...] | None:
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                return tuple(int(dimension) for dimension in shape)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(value, tuple):
+            return ()
+        if not value:
+            return (0,)
+        child_shapes = [self._capture_value_shape(child) for child in value]
+        first_shape = child_shapes[0]
+        if first_shape is None or any(child_shape != first_shape for child_shape in child_shapes[1:]):
+            return None
+        return (len(value), *first_shape)
+
+    def _invalidate_capture_chain(self, prepared: _PreparedCapture) -> None:
+        if prepared.chain_id is None:
+            return
+        try:
+            chain_index, chain = self._find_active_chain(prepared.chain_id)
+        except RuntimeError:
+            return
+        if chain.updated_seq != prepared.base_chain_updated_seq:
+            return
+        del self.active_chains[chain_index]
+        self._touch()
+
+    async def _invalidate_failed_transaction(self, prepared: _PreparedCapture) -> None:
+        async with self.request_lock:
+            if self.phase == SessionPhase.ACTIVE:
+                self._invalidate_capture_chain(prepared)
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
         """Store session-level reward metadata without closing the session."""

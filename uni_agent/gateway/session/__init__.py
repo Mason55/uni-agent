@@ -10,9 +10,13 @@ from typing import Any
 
 __all__ = [
     "CapturedGeneration",
+    "CaptureDomainError",
+    "CaptureErrorCode",
     "CaptureReceipt",
     "CaptureTransaction",
+    "CaptureTransactionError",
     "CaptureUsage",
+    "CaptureValidationError",
     "InternalGenerationRequest",
     "GatewaySession",
     "MessageCodec",
@@ -35,10 +39,32 @@ def __getattr__(name: str) -> Any:
         from .session import GatewaySession
 
         return GatewaySession
-    if name in {"SessionLifecycleError", "SessionPhase", "TrajectoryBuffer", "TrajectorySession"}:
-        from .trajectory_session import SessionLifecycleError, SessionPhase, TrajectoryBuffer, TrajectorySession
+    if name in {
+        "CaptureDomainError",
+        "CaptureErrorCode",
+        "CaptureTransactionError",
+        "CaptureValidationError",
+        "SessionLifecycleError",
+        "SessionPhase",
+        "TrajectoryBuffer",
+        "TrajectorySession",
+    }:
+        from .trajectory_session import (
+            CaptureDomainError,
+            CaptureErrorCode,
+            CaptureTransactionError,
+            CaptureValidationError,
+            SessionLifecycleError,
+            SessionPhase,
+            TrajectoryBuffer,
+            TrajectorySession,
+        )
 
         return {
+            "CaptureDomainError": CaptureDomainError,
+            "CaptureErrorCode": CaptureErrorCode,
+            "CaptureTransactionError": CaptureTransactionError,
+            "CaptureValidationError": CaptureValidationError,
             "SessionLifecycleError": SessionLifecycleError,
             "SessionPhase": SessionPhase,
             "TrajectoryBuffer": TrajectoryBuffer,

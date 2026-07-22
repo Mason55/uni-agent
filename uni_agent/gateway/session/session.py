@@ -130,11 +130,6 @@ class GatewaySession:
         return self._trajectory_session.materialized_chains
 
     @property
-    def reserved_chain_ids(self) -> set[int]:
-        """Expose reservations to the legacy rollout implementation."""
-        return self._trajectory_session.reserved_chain_ids
-
-    @property
     def reward_info(self) -> dict[str, Any]:
         """Expose reward metadata for backwards compatibility."""
         return self._trajectory_session.reward_info
@@ -194,7 +189,7 @@ class GatewaySession:
                         completion_tokens=0,
                     )
                 if encoded.chain_id is not None:
-                    self.reserved_chain_ids.add(encoded.chain_id)
+                    self._trajectory_session._reserve_chain(encoded.chain_id)
                     reserved_chain_id = encoded.chain_id
 
             try:
@@ -248,7 +243,7 @@ class GatewaySession:
                 )
                 self._commit_generation_to_chain(encoded, assistant_msg)
                 if reserved_chain_id is not None:
-                    self.reserved_chain_ids.discard(reserved_chain_id)
+                    self._trajectory_session._discard_chain_reservation(reserved_chain_id)
                     reserved_chain_id = None
                 self._touch()
                 return GenerationOutcome(
@@ -382,7 +377,7 @@ class GatewaySession:
         candidates = [
             chain
             for chain in self.active_chains
-            if chain.chain_id not in self.reserved_chain_ids
+            if not self._trajectory_session._is_chain_reserved(chain.chain_id)
             and chain.active_tool_schemas == tools
             and self._is_chain_prefix_hash_match(
                 chain=chain,

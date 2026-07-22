@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
@@ -538,3 +539,313 @@ async def test_passive_capture_response_budget_clamps_then_closes_exhausted_chai
     assert trajectory.response_ids[-1] == second_receipt.response_ids[-1]
     assert trajectory.response_mask.count(1) == 4
     assert trajectory.extra_fields == {"materialization_reason": "max_response_length"}
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_concurrent_siblings_reserve_distinct_chains():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-reserved-siblings"),
+        MessageCodec(FakeTokenizer()),
+    )
+    prompt = [{"role": "user", "content": "same"}]
+    seed_receipts = []
+    for response_token in (65, 66, 67):
+        transaction = await session.capture({"messages": prompt, "tools": None, "sampling_params": {}})
+        seed_receipts.append(
+            await transaction.commit(
+                CapturedGeneration(
+                    assistant_message={"role": "assistant", "content": chr(response_token)},
+                    prompt_ids=transaction.context_ids,
+                    completion_ids=(response_token,),
+                    completion_logprobs=(-0.1,),
+                    stop_reason="completed",
+                )
+            )
+        )
+    continuations = [
+        [*prompt, {"role": "assistant", "content": chr(token)}, {"role": "user", "content": "next"}]
+        for token in (67, 66, 65)
+    ]
+    transactions = [
+        await session.capture({"messages": messages, "tools": None, "sampling_params": {}})
+        for messages in continuations
+    ]
+    fallback = await session.capture(
+        {"messages": continuations[0], "tools": None, "sampling_params": {}}
+    )
+
+    receipts = []
+    for transaction, token in [
+        (fallback, 90),
+        (transactions[0], 88),
+        (transactions[2], 86),
+        (transactions[1], 87),
+    ]:
+        receipts.append(
+            await transaction.commit(
+                CapturedGeneration(
+                    assistant_message={"role": "assistant", "content": chr(token)},
+                    prompt_ids=transaction.context_ids,
+                    completion_ids=(token,),
+                    completion_logprobs=(-0.2,),
+                    stop_reason="completed",
+                )
+            )
+        )
+
+    assert {receipt.chain_id for receipt in receipts} == {
+        *(receipt.chain_id for receipt in seed_receipts),
+        4,
+    }
+    assert [receipt.chain_id for receipt in receipts] == [4, 3, 1, 2]
+    trajectories = await session.finalize()
+    assert len(trajectories) == 4
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_cleanup_releases_chain_for_every_exit_path():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-capture-cleanup"),
+        MessageCodec(FakeTokenizer()),
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    first_receipt = await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first.context_ids,
+            completion_ids=(79,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+    continuation_request = {
+        "messages": continuation_messages,
+        "tools": None,
+        "sampling_params": {},
+    }
+
+    rolled_back = await session.capture(continuation_request)
+    await rolled_back.rollback()
+    await rolled_back.rollback()
+
+    with pytest.raises(RuntimeError, match="backend boom"):
+        async with await session.capture(continuation_request):
+            raise RuntimeError("backend boom")
+
+    with pytest.raises(ValueError, match="caller boom"):
+        async with await session.capture(continuation_request):
+            raise ValueError("caller boom")
+
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def cancelled_rollout():
+        async with await session.capture(continuation_request):
+            entered.set()
+            await never.wait()
+
+    cancelled_task = asyncio.create_task(cancelled_rollout())
+    await entered.wait()
+    cancelled_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_task
+
+    failed_commit = await session.capture(continuation_request)
+    with pytest.raises(TypeError, match="JSON serializable"):
+        await failed_commit.commit(
+            CapturedGeneration(
+                assistant_message={"role": "assistant", "content": object()},
+                prompt_ids=failed_commit.context_ids,
+                completion_ids=(70,),
+                completion_logprobs=(-0.4,),
+                stop_reason="completed",
+            )
+        )
+
+    retry = await session.capture(continuation_request)
+    retry_receipt = await retry.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "TWO"},
+            prompt_ids=retry.context_ids,
+            completion_ids=(84,),
+            completion_logprobs=(-0.2,),
+            stop_reason="completed",
+        )
+    )
+    assert retry_receipt.chain_id == first_receipt.chain_id
+
+    third_messages = [
+        *continuation_messages,
+        {"role": "assistant", "content": "TWO"},
+        {"role": "user", "content": "again"},
+    ]
+    third = await session.capture({"messages": third_messages, "tools": None, "sampling_params": {}})
+    third_receipt = await third.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "THREE"},
+            prompt_ids=third.context_ids,
+            completion_ids=(72,),
+            completion_logprobs=(-0.3,),
+            stop_reason="completed",
+        )
+    )
+    assert third_receipt.chain_id == first_receipt.chain_id
+    [trajectory] = await session.finalize()
+    assert trajectory.response_ids[-1] == 72
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_repeated_cancellation_cannot_cancel_reservation_cleanup():
+    class BlockingCodec(MessageCodec):
+        def __init__(self):
+            super().__init__(FakeTokenizer())
+            self.block_next = False
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def extract_multi_modal_data(self, messages):
+            if self.block_next:
+                self.block_next = False
+                self.entered.set()
+                await self.release.wait()
+            return await super().extract_multi_modal_data(messages)
+
+    codec = BlockingCodec()
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-double-cancel-cleanup"),
+        codec,
+    )
+    first_messages = [{"role": "user", "content": "first"}]
+    first = await session.capture({"messages": first_messages, "tools": None, "sampling_params": {}})
+    first_receipt = await first.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "ONE"},
+            prompt_ids=first.context_ids,
+            completion_ids=(79,),
+            completion_logprobs=(-0.1,),
+            stop_reason="completed",
+        )
+    )
+    continuation_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "ONE"},
+        {"role": "user", "content": "next"},
+    ]
+    continuation_request = {
+        "messages": continuation_messages,
+        "tools": None,
+        "sampling_params": {},
+    }
+    reserved = await session.capture(continuation_request)
+
+    codec.block_next = True
+    lock_holder = asyncio.create_task(
+        session.capture(
+            {
+                "messages": [{"role": "user", "content": "hold session lock"}],
+                "tools": None,
+                "sampling_params": {},
+            }
+        )
+    )
+    await codec.entered.wait()
+    cleanup = asyncio.create_task(reserved.rollback())
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    codec.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    holder_transaction = await lock_holder
+    await holder_transaction.rollback()
+
+    retry = await session.capture(continuation_request)
+    retry_receipt = await retry.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "TWO"},
+            prompt_ids=retry.context_ids,
+            completion_ids=(84,),
+            completion_logprobs=(-0.2,),
+            stop_reason="completed",
+        )
+    )
+    assert retry_receipt.chain_id == first_receipt.chain_id
+
+
+@pytest.mark.asyncio
+async def test_passive_capture_main_and_subagent_commit_to_reserved_chains_out_of_order():
+    session = TrajectorySession(
+        SessionHandle(session_id="passive-main-subagent"),
+        MessageCodec(FakeTokenizer()),
+    )
+    main_messages = [
+        {"role": "system", "content": "main"},
+        {"role": "user", "content": "work"},
+    ]
+    sub_messages = [
+        {"role": "system", "content": "subagent"},
+        {"role": "user", "content": "research"},
+    ]
+    seed_receipts = []
+    for messages, token in ((main_messages, 77), (sub_messages, 83)):
+        transaction = await session.capture({"messages": messages, "tools": None, "sampling_params": {}})
+        seed_receipts.append(
+            await transaction.commit(
+                CapturedGeneration(
+                    assistant_message={"role": "assistant", "content": chr(token)},
+                    prompt_ids=transaction.context_ids,
+                    completion_ids=(token,),
+                    completion_logprobs=(-0.1,),
+                    stop_reason="completed",
+                )
+            )
+        )
+    main_continuation = [
+        *main_messages,
+        {"role": "assistant", "content": "M"},
+        {"role": "user", "content": "continue"},
+    ]
+    sub_continuation = [
+        *sub_messages,
+        {"role": "assistant", "content": "S"},
+        {"role": "user", "content": "continue"},
+    ]
+    main = await session.capture(
+        {"messages": main_continuation, "tools": None, "sampling_params": {}}
+    )
+    subagent = await session.capture(
+        {"messages": sub_continuation, "tools": None, "sampling_params": {}}
+    )
+
+    sub_receipt = await subagent.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "s"},
+            prompt_ids=subagent.context_ids,
+            completion_ids=(115,),
+            completion_logprobs=(-0.2,),
+            stop_reason="completed",
+        )
+    )
+    main_receipt = await main.commit(
+        CapturedGeneration(
+            assistant_message={"role": "assistant", "content": "m"},
+            prompt_ids=main.context_ids,
+            completion_ids=(109,),
+            completion_logprobs=(-0.3,),
+            stop_reason="completed",
+        )
+    )
+
+    assert main_receipt.chain_id == seed_receipts[0].chain_id
+    assert sub_receipt.chain_id == seed_receipts[1].chain_id
+    trajectories = await session.finalize()
+    assert len(trajectories) == 2
+    assert {trajectory.response_ids[-1] for trajectory in trajectories} == {109, 115}

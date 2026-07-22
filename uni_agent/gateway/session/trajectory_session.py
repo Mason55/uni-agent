@@ -99,11 +99,18 @@ class _PreparedCapture:
 class _CaptureTransaction:
     """Opaque asynchronous transaction for one externally-owned model call."""
 
-    def __init__(self, session: TrajectorySession, prepared: _PreparedCapture):
+    def __init__(
+        self,
+        session: TrajectorySession,
+        prepared: _PreparedCapture,
+        reserved_chain_id: int | None,
+    ):
         self._session = session
         self._prepared = prepared
+        self._reserved_chain_id = reserved_chain_id
         self._commit_lock = asyncio.Lock()
         self._receipt: CaptureReceipt | None = None
+        self._closed = False
 
     @property
     def context_ids(self) -> tuple[int, ...]:
@@ -134,13 +141,53 @@ class _CaptureTransaction:
         """Return whether the session budget forbids another model token."""
         return self._prepared.length_exhausted_trajectory is not None
 
+    async def __aenter__(self) -> _CaptureTransaction:
+        """Enter the transaction scope used around externally-owned rollout."""
+        if self._closed:
+            raise RuntimeError("capture transaction is closed")
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        """Release any uncommitted reservation on scope exit."""
+        await self.rollback()
+        return False
+
     async def commit(self, generation: CapturedGeneration) -> CaptureReceipt:
         """Commit externally-produced rollout truth and return its receipt."""
         async with self._commit_lock:
             if self._receipt is not None:
                 raise RuntimeError("capture transaction is already committed")
-            self._receipt = await self._session._commit_capture(self._prepared, generation)
-            return self._receipt
+            if self._closed:
+                raise RuntimeError("capture transaction is closed")
+            try:
+                self._receipt = await self._session._commit_capture(self._prepared, generation)
+                return self._receipt
+            finally:
+                await self._close()
+
+    async def rollback(self) -> None:
+        """Discard this capture and release its chain reservation."""
+        async with self._commit_lock:
+            if self._closed:
+                return
+            await self._close()
+
+    async def _close(self) -> None:
+        reserved_chain_id = self._reserved_chain_id
+        self._reserved_chain_id = None
+        self._closed = True
+        if reserved_chain_id is None:
+            return
+        release_task = asyncio.create_task(self._session._release_chain_reservation(reserved_chain_id))
+        cancelled = False
+        while not release_task.done():
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        release_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 class TrajectorySession:
@@ -168,7 +215,7 @@ class TrajectorySession:
         self._sampling_params = deepcopy(sampling_params or {})
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
-        self.reserved_chain_ids: set[int] = set()
+        self._reserved_chain_ids: set[int] = set()
         self._next_chain_id = 1
         self._order_seq = 0
         self.reward_info: dict[str, Any] = {}
@@ -230,25 +277,23 @@ class TrajectorySession:
                     self._response_length is not None
                     and len(buffer.response_mask) + len(incremental_ids) >= self._response_length
                 ):
-                    return _CaptureTransaction(
-                        self,
-                        _PreparedCapture(
-                            buffer=buffer,
-                            context_ids=tuple(buffer.prompt_ids + buffer.response_ids),
-                            sampling_params={},
-                            messages=messages,
-                            tools=tools,
-                            image_data=image_data,
-                            video_data=video_data,
-                            chain_id=chain_id,
-                            turn_id=turn_id,
-                            incoming_message_prefix_hashes=incoming_message_prefix_hashes,
-                            length_exhausted_trajectory=self._build_materialized_trajectory(
-                                chain=selected_chain,
-                                extra_fields={"materialization_reason": "max_response_length"},
-                            ),
+                    prepared = _PreparedCapture(
+                        buffer=buffer,
+                        context_ids=tuple(buffer.prompt_ids + buffer.response_ids),
+                        sampling_params={},
+                        messages=messages,
+                        tools=tools,
+                        image_data=image_data,
+                        video_data=video_data,
+                        chain_id=chain_id,
+                        turn_id=turn_id,
+                        incoming_message_prefix_hashes=incoming_message_prefix_hashes,
+                        length_exhausted_trajectory=self._build_materialized_trajectory(
+                            chain=selected_chain,
+                            extra_fields={"materialization_reason": "max_response_length"},
                         ),
                     )
+                    return self._open_capture_transaction(prepared)
                 buffer.response_ids.extend(incremental_ids)
                 buffer.response_mask.extend([0] * len(incremental_ids))
                 if sampling_params.get("logprobs", False):
@@ -283,7 +328,13 @@ class TrajectorySession:
                 turn_id=turn_id,
                 incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
             )
-            return _CaptureTransaction(self, prepared)
+            return self._open_capture_transaction(prepared)
+
+    def _open_capture_transaction(self, prepared: _PreparedCapture) -> _CaptureTransaction:
+        reserved_chain_id = prepared.chain_id
+        if reserved_chain_id is not None:
+            self._reserve_chain(reserved_chain_id)
+        return _CaptureTransaction(self, prepared, reserved_chain_id)
 
     async def _commit_capture(
         self,
@@ -392,7 +443,7 @@ class TrajectorySession:
                 raise SessionLifecycleError(f"Session {self.handle.session_id} is finalized")
             self._touch()
             self._materialize_active_chains()
-            self.reserved_chain_ids.clear()
+            self._reserved_chain_ids.clear()
             self.phase = SessionPhase.FINALIZED
             self._touch()
             ordered_trajectories = [
@@ -411,7 +462,7 @@ class TrajectorySession:
             self.phase = SessionPhase.ABORTED
             self.active_chains = []
             self.materialized_chains = []
-            self.reserved_chain_ids.clear()
+            self._reserved_chain_ids.clear()
             self._touch()
 
     def snapshot_state(self) -> dict[str, Any]:
@@ -481,7 +532,7 @@ class TrajectorySession:
         candidates = [
             chain
             for chain in self.active_chains
-            if chain.chain_id not in self.reserved_chain_ids
+            if not self._is_chain_reserved(chain.chain_id)
             and chain.active_tool_schemas == tools
             and self._is_chain_prefix_hash_match(
                 chain=chain,
@@ -518,7 +569,16 @@ class TrajectorySession:
 
     async def _release_chain_reservation(self, chain_id: int) -> None:
         async with self.request_lock:
-            self.reserved_chain_ids.discard(chain_id)
+            self._discard_chain_reservation(chain_id)
+
+    def _reserve_chain(self, chain_id: int) -> None:
+        self._reserved_chain_ids.add(chain_id)
+
+    def _discard_chain_reservation(self, chain_id: int) -> None:
+        self._reserved_chain_ids.discard(chain_id)
+
+    def _is_chain_reserved(self, chain_id: int) -> bool:
+        return chain_id in self._reserved_chain_ids
 
     def _next_order_seq(self) -> int:
         self._order_seq += 1

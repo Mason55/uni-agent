@@ -258,6 +258,7 @@ def _trajectory(
     prompt_ids: list[int] | None = None,
     response_ids: list[int] | None = None,
     response_logprobs: list[float] | None = None,
+    routed_experts=None,
     reward_info: dict[str, object] | None = None,
     num_turns: int = 2,
     extra_fields: dict[str, object] | None = None,
@@ -269,6 +270,7 @@ def _trajectory(
         response_ids=response_ids,
         response_mask=[1] * len(response_ids),
         response_logprobs=response_logprobs,
+        routed_experts=routed_experts,
         reward_info=dict(reward_info or {}),
         reward_score=None,
         num_turns=num_turns,
@@ -410,6 +412,7 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
             "session-0-0": [
                 _trajectory(
                     response_logprobs=[-0.1, -0.2],
+                    routed_experts=[[[1]], [[2]], [[3]], [[4]]],
                     extra_fields={"materialization_reason": "max_response_length"},
                 )
             ],
@@ -475,6 +478,7 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     assert fields["attention_mask"][0].tolist() == [1, 1, 1, 1]
     assert fields["position_ids"][0].tolist() == [0, 1, 2, 3]
     assert fields["rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2])
+    assert fields["routed_experts"][0].tolist() == [[[1]], [[2]], [[3]], [[4]]]
     assert fields["rm_scores"][0].tolist() == [0.0, 0.25]
     assert tu.get(fields, "multi_modal_inputs") == [{}]
     assert tu.get(fields, "uid") == ["uid-0"]

@@ -602,7 +602,7 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
     assert backend_request["image_data"] == ["image://a.png"]
     assert backend_request["video_data"] is None
     assert backend_request["prompt_ids"] == expected_prompt_ids
-    assert backend_request["sampling_params"] == {"temperature": 0.25}
+    assert backend_request["sampling_params"] == {"temperature": 0.25, "logprobs": True}
     assert len(trajectories) == 1
     assert trajectories[0].multi_modal_data == {"images": ["image://a.png"]}
 
@@ -941,7 +941,12 @@ async def test_gateway_actor_context_change_splits_trajectory(ray_runtime, sessi
             {
                 "backend": RejectRequestEnvelopeBackend(
                     "SAFE",
-                    expected_sampling_params={"temperature": 0.25, "top_p": 0.8, "max_tokens": 128},
+                    expected_sampling_params={
+                        "temperature": 0.25,
+                        "top_p": 0.8,
+                        "max_tokens": 128,
+                        "logprobs": True,
+                    },
                 ),
                 "base_sampling_params": {"temperature": 0.1, "top_p": 0.8, "max_tokens": 64},
                 "allowed_request_sampling_param_keys": {"temperature", "max_tokens"},
@@ -959,7 +964,7 @@ async def test_gateway_actor_context_change_splits_trajectory(ray_runtime, sessi
             {
                 "backend": RejectRequestEnvelopeBackend(
                     "SAFE",
-                    expected_sampling_params={"temperature": 0.1, "top_p": 0.9},
+                    expected_sampling_params={"temperature": 0.1, "top_p": 0.9, "logprobs": True},
                 ),
                 "base_sampling_params": {"temperature": 0.1, "top_p": 0.9},
                 "allowed_request_sampling_param_keys": {"temperature"},
@@ -1062,7 +1067,7 @@ async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_
             "top_p": 0.9,
             "top_k": -1,
             "presence_penalty": 0.3,
-            "logprobs": False,
+            "logprobs": True,
             "max_tokens": 64,
         },
     ]

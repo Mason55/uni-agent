@@ -85,12 +85,12 @@ class _RoutedExpertsBackend:
         self.steps = list(steps)
 
     async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
-        text, routed_experts = self.steps.pop(0)
+        text, expert_id = self.steps.pop(0)
         token_ids = _ids(text)
         return TokenOutput(
             token_ids=token_ids,
-            log_probs=None,
-            routed_experts=routed_experts,
+            log_probs=[-0.1] * len(token_ids),
+            routed_experts=[[[expert_id]]] * (len(prompt_ids) + len(token_ids)),
             stop_reason="completed",
         )
 
@@ -193,8 +193,8 @@ async def test_multiple_chains_preserve_latest_full_context_routed_experts():
     session = _session("routed-experts")
     backend = _RoutedExpertsBackend(
         [
-            ("FIRST", [[1], [2]]),
-            ("SECOND", [[3], [4], [5]]),
+            ("FIRST", 1),
+            ("SECOND", 2),
         ]
     )
     first_messages = [{"role": "user", "content": "first turn"}]
@@ -210,7 +210,8 @@ async def test_multiple_chains_preserve_latest_full_context_routed_experts():
     trajectories = await session.finalize()
 
     assert len(trajectories) == 1
-    assert trajectories[0].routed_experts == [[3], [4], [5]]
+    assert len(trajectories[0].routed_experts) == len(trajectories[0].prompt_ids) + len(trajectories[0].response_ids)
+    assert trajectories[0].routed_experts[0] == [[2]]
 
 
 @pytest.mark.asyncio
@@ -1162,22 +1163,22 @@ async def test_multiple_chains_requested_response_logprobs_stay_aligned():
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_unrequested_response_logprobs_are_ignored():
-    """Ignore backend logprobs unless the effective sampling params request them."""
+async def test_multiple_chains_captures_backend_logprobs_even_when_not_requested():
+    """Preserve actual backend logprobs independently of caller sampling flags."""
     session = _session("logprobs-not-requested")
 
     await _run(session, _LogprobBackend([("FIRST", "full")]), [{"role": "user", "content": "first turn"}])
     [trajectory] = await session.finalize()
 
-    assert trajectory.response_logprobs is None
+    assert trajectory.response_logprobs == [-0.1] * len("FIRST")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("backend_logprobs", "error_match"),
     [
-        (None, "backend omitted logprobs when requested"),
-        ("short", "backend logprobs must align with token_ids: got 1 logprobs for 5 tokens"),
+        (None, "upstream completion log-probabilities are required"),
+        ("short", "completion log-probabilities must align with completion token IDs"),
     ],
 )
 async def test_multiple_chains_requested_response_logprobs_reject_invalid_backend_output(
@@ -1187,12 +1188,13 @@ async def test_multiple_chains_requested_response_logprobs_reject_invalid_backen
     """Reject missing or misaligned requested logprobs without creating a chain."""
     session = _session("logprobs-invalid", sampling_params={"logprobs": True})
 
-    with pytest.raises(RuntimeError, match=error_match):
+    with pytest.raises(HTTPException, match=error_match) as error:
         await _run(
             session,
             _LogprobBackend([("FIRST", backend_logprobs)]),
             [{"role": "user", "content": "first turn"}],
         )
+    assert error.value.status_code == 500
 
     state = session.snapshot_state()
     assert state["active_chain_ids"] == []
@@ -1202,7 +1204,7 @@ async def test_multiple_chains_requested_response_logprobs_reject_invalid_backen
 
 @pytest.mark.asyncio
 async def test_multiple_chains_invalid_continuation_logprobs_release_chain_for_retry():
-    """Keep the selected chain unchanged and reusable after logprob validation fails."""
+    """Drop the failed chain and allow an independent full-encode retry."""
     session = _session("logprobs-retry", sampling_params={"logprobs": True})
     first_messages = [{"role": "user", "content": "first turn"}]
     continuation = [
@@ -1211,20 +1213,20 @@ async def test_multiple_chains_invalid_continuation_logprobs_release_chain_for_r
         {"role": "user", "content": "follow up"},
     ]
 
-    await _run(session, _LogprobBackend([("FIRST", "full")]), first_messages)
-    state_before_failure = session.snapshot_state()
+    first = await _run(session, _LogprobBackend([("FIRST", "full")]), first_messages)
 
-    with pytest.raises(RuntimeError, match="backend omitted logprobs when requested"):
+    with pytest.raises(HTTPException, match="upstream completion log-probabilities are required") as error:
         await _run(session, _LogprobBackend([("SECOND", None)]), continuation)
+    assert error.value.status_code == 500
 
     state_after_failure = session.snapshot_state()
-    assert state_after_failure["active_chain_ids"] == state_before_failure["active_chain_ids"]
-    assert state_after_failure["active_chain_tip_hashes"] == state_before_failure["active_chain_tip_hashes"]
+    assert state_after_failure["active_chain_ids"] == []
 
-    await _run(session, _LogprobBackend([("RETRY", "full")]), continuation)
+    retry = await _run(session, _LogprobBackend([("RETRY", "full")]), continuation)
+    assert retry.capture_receipt.chain_id != first.capture_receipt.chain_id
     [trajectory] = await session.finalize()
 
-    assert _decode_response_ids(trajectory.response_ids).endswith("RETRY")
+    assert _decode_response_ids(trajectory.response_ids) == "RETRY"
     assert "SECOND" not in _decode_response_ids(trajectory.response_ids)
     assert trajectory.response_logprobs is not None
     assert len(trajectory.response_logprobs) == len(trajectory.response_ids)

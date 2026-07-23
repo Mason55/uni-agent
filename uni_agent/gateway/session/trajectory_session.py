@@ -306,9 +306,7 @@ class TrajectorySession:
                 buffer = self._copy_trajectory_buffer(selected_chain.buffer)
                 image_data, video_data = self._copy_chain_media(selected_chain)
                 chain_id = selected_chain.chain_id
-                turn_id = sum(
-                    1 for message in selected_chain.message_history if message.get("role") == "assistant"
-                ) + 1
+                turn_id = sum(1 for message in selected_chain.message_history if message.get("role") == "assistant") + 1
                 incremental_messages = messages[len(selected_chain.message_history) :]
                 incremental_ids: list[int] = []
                 new_image_data = None
@@ -347,8 +345,7 @@ class TrajectorySession:
                     return self._open_capture_transaction(prepared)
                 buffer.response_ids.extend(incremental_ids)
                 buffer.response_mask.extend([0] * len(incremental_ids))
-                if sampling_params.get("logprobs", False):
-                    buffer.response_logprobs.extend([0.0] * len(incremental_ids))
+                buffer.response_logprobs.extend([0.0] * len(incremental_ids))
                 if new_image_data:
                     if image_data is None:
                         image_data = []
